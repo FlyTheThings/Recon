@@ -13,12 +13,13 @@
 
 //External Includes
 #include <opencv2/opencv.hpp>
+#include "torch/script.h"
+#include "torch/torch.h"
+#include "torch/csrc/jit/passes/tensorexpr_fuser.h"
 
 //Project Includes
 #include "../../EigenAliases.h"
 #include "../Shadow-Detection/ShadowDetection.hpp"
-#include <torch/script.h>
-#include <torch/torch.h>
 
 namespace ShadowPropagation {
 	//Class for a time-stamped, geo-registered time available function - each pixel corresponds to a patch of ground. We use type uint16_t and
@@ -54,7 +55,7 @@ namespace ShadowPropagation {
 			std::mutex        m_mutex;
 			static const int  TARGET_INPUT_LENGTH = 10;
 			static const int  TIME_HORIZON = 10;
-			static constexpr double OUTPUT_THRESHOLD = 0.4;
+			static constexpr double OUTPUT_THRESHOLD = 0.5;
 
 			int               m_callbackHandle; //Handle for this objects shadow detection engine callback
 			std::unordered_map<int, std::function<void(TimeAvailableFunction const & TA)>> m_callbacks;
@@ -82,7 +83,7 @@ namespace ShadowPropagation {
 										// By default, select CUDA if the hardware supports it 
 										m_device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU) {
 				m_engineThread = std::thread(&ShadowPropagationEngine::ModuleMain, this);
-
+				torch::jit::setTensorExprFuserEnabled(false);
 				// If CUDA is being used, load the CUDA version of the LSTM, otherwise load the CPU version
 				if (m_device.is_cuda()) {
                 	m_module = torch::jit
