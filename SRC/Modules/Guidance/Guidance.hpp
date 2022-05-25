@@ -76,6 +76,7 @@ namespace Guidance {
 			std::vector<DroneInterface::WaypointMission> m_droneMissions; //Item n covers component n of the partition
 			std::vector<DroneInterface::Waypoint> m_droneStartPositions;
 			std::vector<bool> m_flyingMissionStatus;
+			std::vector<bool> m_wasPredictedToFinishWithoutShadows;
 			//other items... e.g. the partition of the survey region, pre-planned waypoint missions for each, a vector of completed sub-regions, etc.
 			
 			void ModuleMain(void);
@@ -104,6 +105,7 @@ namespace Guidance {
 			bool AddLowFlier(std::string const & Serial); //Add a drone to the collection of low fliers and start commanding it
 			bool RemoveLowFlier(std::string const & Serial); //Stop commanding the drone with the given serial
 			bool IsRunning(void); //Returns true if currently commanding a mission, false otherwise
+			void RefreshDronePositions(void);
 			void RefreshSequence(void);
 
 			inline std::vector<std::string> GetSerialsOfDronesUnderCommand(void);
