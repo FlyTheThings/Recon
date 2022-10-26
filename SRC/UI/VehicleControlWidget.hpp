@@ -353,10 +353,14 @@ inline void VehicleControlWidget::ControlThreadMain(void) {
 						double MSA;
 						Eigen::Vector2d Position_NM = LatLonToNM(Eigen::Vector2d(dronePos_LLA(0), dronePos_LLA(1)));
 						if (Maps::DataTileProvider::Instance()->TryGetData(Position_NM, Maps::DataLayer::MinSafeAltitude, MSA)) {
-							double groundAlt = dronePos_LLA(2) - droneHAG;
-							double minSafeHAG = MSA - groundAlt;
-							double targetHAG = minSafeHAG + 1.0; //Fly 1 meter above MSA to avoid triggering watchdog alarms
-							myState->m_targetHAGFeet = targetHAG*3.280839895;
+							if (std::isnan(MSA))
+								std::cerr << "Can't fly at deck - no min safe altitude at location.\r\n";
+							else {
+								double groundAlt = dronePos_LLA(2) - droneHAG;
+								double minSafeHAG = MSA - groundAlt;
+								double targetHAG = minSafeHAG + 1.0; //Fly 1 meter above MSA to avoid triggering watchdog alarms
+								myState->m_targetHAGFeet = targetHAG*3.280839895;
+							}
 						}
 					}
 					
@@ -1029,14 +1033,22 @@ inline bool VehicleControlWidget::DrawMapOverlay(Eigen::Vector2d const & CursorP
 			
 			//Draw drone label
 			std::string droneLabel = std::to_string((unsigned int) n + 1U);
-			bool hazardIcon = droneStates[n]->m_hazard;
-			bool mouseIcon = (IsFlying && droneStates[n]->m_widgetControlEnabled);
+			bool hazardIcon  = droneStates[n]->m_hazard;
+			std::string controlIcon;
+			if (IsFlying) {
+				if (droneStates[n]->m_widgetControlEnabled)
+					controlIcon = u8"\uf8cc"; //Mouse Icon
+				else if (Guidance::GuidanceEngine::Instance().IsCommandingDrone(drones[n]->GetDroneSerial()))
+					controlIcon = u8"\uf04b"; //Guidance Module Control Icon
+				else
+					controlIcon = u8"\uf11b"; //Controller Icon
+			}
 			
 			Eigen::Vector2d p5_ScreenSpace = 0.5*(p3_SS + p4_SS);
 			Eigen::Vector2d v1 = R*Eigen::Vector2d(0.0, 1.0);
-			if (hazardIcon && mouseIcon) {
+			if (hazardIcon && (! controlIcon.empty())) {
 				//Use two lines
-				std::string line1 = droneLabel + u8" \uf8cc";
+				std::string line1 = droneLabel + " "s + controlIcon;
 				std::string line2 = u8" \uf071";
 				
 				double lineHeight = ImGui::GetTextLineHeightWithSpacing();
@@ -1052,8 +1064,8 @@ inline bool VehicleControlWidget::DrawMapOverlay(Eigen::Vector2d const & CursorP
 				//Use one line
 				if (hazardIcon)
 					droneLabel += u8" \uf071";
-				if (mouseIcon)
-					droneLabel += u8" \uf8cc";
+				if (! controlIcon.empty())
+					droneLabel += " "s + controlIcon;
 				
 				Eigen::Vector2d p6_ScreenSpace = p5_ScreenSpace + v1*double(ImGui::GetFontSize()); //Center point of label text
 				MyGui::AddText(DrawList, p6_ScreenSpace, IM_COL32_WHITE, droneLabel.c_str(), NULL, true, true);
@@ -1309,6 +1321,9 @@ inline bool VehicleControlWidget::DrawMapOverlay(Eigen::Vector2d const & CursorP
 }
 
 inline void VehicleControlWidget::AllDronesStopAndHover(void) {
+	//Abort any mission the guidance module may be running since this is an All-drone command
+	Guidance::GuidanceEngine::Instance().AbortMission();
+
 	std::scoped_lock lock(m_dronesAndStatesMutex); //Lock vector of drone serials and states
 	m_RTL_State = -1; //Cancel any RTL in progress
 	MapWidget::Instance().m_messageBoxOverlay.RemoveMessage(m_messageToken);
@@ -1332,6 +1347,9 @@ inline void VehicleControlWidget::AllDronesStopAndHover(void) {
 }
 
 inline void VehicleControlWidget::AllDronesHitTheDeck(void) {
+	//Abort any mission the guidance module may be running since this is an All-drone command
+	Guidance::GuidanceEngine::Instance().AbortMission();
+
 	std::scoped_lock lock(m_dronesAndStatesMutex); //Lock vector of drone serials and states
 	m_RTL_State = -1; //Cancel any RTL in progress
 	MapWidget::Instance().m_messageBoxOverlay.RemoveMessage(m_messageToken);
@@ -1368,9 +1386,12 @@ inline void VehicleControlWidget::AllDronesReturnHomeAndLand(void) {
 	//Step 3 - Get max of MSA on all lines from each drone to it's respective home point
 	//Step 4 - Assign staggered RTL HAGs that keeps all drones above max MSA
 	//Step 5 - Start RTL sequence for each drone, with corresponding RTL HAG
-	std::scoped_lock lock(m_dronesAndStatesMutex); //Lock vector of drone serials and states
+	
+	//Abort any mission the guidance module may be running since this is an All-drone command
+	Guidance::GuidanceEngine::Instance().AbortMission();
 
-	std::cerr << "TODO: RTL Sequence requested.\r\n";
+	std::scoped_lock lock(m_dronesAndStatesMutex); //Lock vector of drone serials and states
+	std::cerr << "RTL Sequence initiated.\r\n";
 
 	//Iterate through the connected (flying) drones - put each pointer in a vector - also grab state objects (touching if necessary)
 	//Leave out drones for which GetDrone returns a nullptr so we don't have to constantly check for that later in this function
@@ -1942,6 +1963,7 @@ inline void VehicleControlWidget::DrawContextMenu(bool Open, DroneInterface::Dro
 	}
 }
 
+//This function draws the interactable drone object for a single drone - this is the widget that appears under "Connected Vehicles"
 //TODO: So... drone should be passed as a const & but we need the drone class to be const-correct.
 inline void VehicleControlWidget::DrawDroneInteractable(DroneInterface::Drone & drone, vehicleState & State, size_t DroneIndex) {
 	ImDrawList * draw_list = ImGui::GetWindowDrawList();
@@ -1964,17 +1986,37 @@ inline void VehicleControlWidget::DrawDroneInteractable(DroneInterface::Drone & 
 	float startX = ImGui::GetCursorPosX();
 	ImGui::Image(m_IconTexture_Drone, ImVec2(2.0f*ImGui::GetFontSize(), 2.0f*ImGui::GetFontSize()));
 	ImGui::SameLine(startX + 2.8f*ImGui::GetFontSize());
+
+	//Draw the drone number, hazard indicator (if necessary) and control mode icons (if necessary).
+	//We do this is a way that seems overly complex, but we always use 2 lines when the drone is in the air
+	//so that the drone number doesn't bounce around vertically if entering/exiting a hazard state. This looks
+	//better overall than just having a blank second line when not in hazard (which looks like a mistake).
 	std::string droneNumStr = std::to_string((unsigned int) DroneIndex + 1U);
 	if (State.m_hazard)
 		droneNumStr += u8" \uf071";
 	ImGui::BeginGroup();
-	if (IsFlying && State.m_widgetControlEnabled) {
-		//Draw mouse icon to indicate that drone is currently controlled by this widget (click & drag control)
-		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::CalcTextSize("\uf8cc").x - ImGui::CalcTextSize(droneNumStr.c_str()).x)/2.0f);
-		ImGui::TextUnformatted(droneNumStr.c_str());
-		ImGui::TextUnformatted("\uf8cc");
+	if (IsFlying) {
+		if (State.m_widgetControlEnabled) {
+			//The vehicle control widget is controlling the drone (Click & Drag) - draw mouse icon
+			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::CalcTextSize("\uf8cc").x - ImGui::CalcTextSize(droneNumStr.c_str()).x)/2.0f);
+			ImGui::TextUnformatted(droneNumStr.c_str());
+			ImGui::TextUnformatted("\uf8cc");
+		}
+		else if (Guidance::GuidanceEngine::Instance().IsCommandingDrone(drone.GetDroneSerial())) {
+			//The guidance module is controlling the drone - draw icon to indicate this
+			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::CalcTextSize("\uf04b").x - ImGui::CalcTextSize(droneNumStr.c_str()).x)/2.0f);
+			ImGui::TextUnformatted(droneNumStr.c_str());
+			ImGui::TextUnformatted("\uf04b");
+		}
+		else {
+			//Neither the vehicle control widget or the guidance module is in control - draw controller icon
+			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::CalcTextSize("\uf11b").x - ImGui::CalcTextSize(droneNumStr.c_str()).x)/2.0f);
+			ImGui::TextUnformatted(droneNumStr.c_str());
+			ImGui::TextUnformatted("\uf11b");
+		}
 	}
 	else {
+		//Drone is on ground
 		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 0.5f*ImGui::GetFontSize());
 		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::CalcTextSize("\uf8cc").x - ImGui::CalcTextSize(droneNumStr.c_str()).x)/2.0f);
 		ImGui::TextUnformatted(droneNumStr.c_str());
@@ -2031,10 +2073,20 @@ inline void VehicleControlWidget::DrawDroneInteractable(DroneInterface::Drone & 
 	//Display node background next
 	draw_list->ChannelsSetCurrent(0);
 	
+	//Set background color for interactable. Should indicate hovering and should flash on hazards
+	/*ImGui::InvisibleButton("node", itemRectSize);
+	double t = 0.0;
+	if (State.m_hazard)
+		t = 1.0 - std::abs(2.0*FractionalPart(SecondsSinceT0Epoch(std::chrono::steady_clock::now())/2.0) - 1.0); //(0 - 1 - 0) every 2 s
+	//double t = State.m_hazard ? FractionalPart(SecondsSinceT0Epoch(std::chrono::steady_clock::now())/3.0) : 0.0;
+	Eigen::Vector4d bgColorA = ImGui::IsItemHovered() ? Eigen::Vector4d(0.47,0.47,0.31,1.0) : Eigen::Vector4d(style.Colors[ImGuiCol_Header]);
+	Eigen::Vector4d bgColorB = Eigen::Vector4d(0.6,0.3,0.1,1.0);
+	Eigen::Vector4d bgColor  = t * bgColorB + (1.0 - t) * bgColorA;
+	draw_list->AddRectFilled(pos, (Eigen::Vector2d) (pos + itemRectSize), ImColor(bgColor), 3.0f);*/
+
 	ImGui::InvisibleButton("node", itemRectSize);
 	if (ImGui::IsItemHovered())
-		//draw_list->AddRectFilled(pos, pos + itemRectSize, ImColor(style.Colors[ImGuiCol_HeaderActive]), 3.0f);
-		draw_list->AddRectFilled(pos, (Eigen::Vector2d) (pos + itemRectSize), IM_COL32(120,120,80,255), 3.0f);
+		draw_list->AddRectFilled(pos, (Eigen::Vector2d) (pos + itemRectSize), IM_COL32(125,125,75,255), 3.0f);
 	else
 		draw_list->AddRectFilled(pos, (Eigen::Vector2d) (pos + itemRectSize), ImColor(style.Colors[ImGuiCol_Header]), 3.0f);
 

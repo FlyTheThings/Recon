@@ -1,6 +1,6 @@
 //This module provides the main interface for the guidance system
 //Authors: Bryan Poling
-//Copyright (c) 2021 Sentek Systems, LLC. All rights reserved. 
+//Copyright (c) 2021 Sentek Systems, LLC. All rights reserved.
 
 //System Includes
 //#include <vector>
@@ -19,6 +19,7 @@
 #include "Guidance.hpp"
 #include "../../UI/VehicleControlWidget.hpp"
 #include "../../Utilities.hpp"
+#include "../../Maps/MapUtils.hpp"
 //#include "../../EigenAliases.h"
 //#include "../../SurveyRegionManager.hpp"
 //#include "../../Polygon.hpp"
@@ -26,15 +27,13 @@
 //#include "../DJI-Drone-Interface/DroneManager.hpp"
 
 #define PI 3.14159265358979323846
-#define radiusEarth 6371000 // Radius of the earth metres
-#define heightECEF 4.4272e+06;
-#define TOLERANCE 1e-10
+//#define TOLERANCE 1e-10
 namespace Guidance {
     // *********************************************************************************************************************************
     // **************************************   GuidanceEngine Non-Inline Functions Definitions   **************************************
     // *********************************************************************************************************************************
     //Start a survey mission (currently active region) using the given drones
-    bool GuidanceEngine::StartSurvey(std::vector<std::string> const & LowFlierSerials, ImagingRequirements const & Reqs) {
+    bool GuidanceEngine::StartSurvey(std::vector<std::string> const & LowFlierSerials, MissionParameters const & Params) {
         std::scoped_lock lock(m_mutex);
         if (m_running)
             return false; //Require stopping the previous mission first
@@ -42,7 +41,7 @@ namespace Guidance {
             return false; //Require at least 1 drone to start a mission
         if (! SurveyRegionManager::Instance().GetCopyOfActiveRegionData(nullptr, &m_surveyRegion, nullptr))
             return false; //No active survey region
-        m_ImagingReqs = Reqs;
+        m_MissionParams = Params;
         m_dronesUnderCommand.clear();
         for (std::string serial : LowFlierSerials) {
             DroneInterface::Drone * ptr = DroneInterface::DroneManager::Instance().GetDrone(serial);
@@ -52,8 +51,10 @@ namespace Guidance {
             }
         }
         if (m_dronesUnderCommand.size() == LowFlierSerials.size()) {
-            m_running = true;
+            ResetIntermediateData();
             m_missionPrepDone = false; //This will trigger the pre-planning work that needs to happen for a new mission
+            MapWidget::Instance().m_guidanceOverlay.Reset(); //Clear any previous guidance overlay data
+            m_running = true;
             return true;
         }
         else
@@ -90,19 +91,42 @@ namespace Guidance {
             return false;
         for (size_t n = 0U; n < m_dronesUnderCommand.size(); n++) {
             if (m_dronesUnderCommand[n]->GetDroneSerial() == Serial) {
-                m_currentDroneMissions.erase(Serial);
+                //m_currentDroneMissions.erase(Serial);
+
+                //If this drone was doing something useful, update things accordingly
+                if (m_droneStates.count(Serial) > 0U) {
+                	if (std::get<0>(m_droneStates.at(Serial)) > 1) {
+                		//The drone was tasked with or flying a mission
+                		int missionIndex = std::get<1>(m_droneStates.at(Serial));
+                		m_availableMissionIndices.insert(missionIndex);
+                	}
+                }
+
+                //Remove the drone from our vector of drone pointers under our command
                 m_dronesUnderCommand.erase(m_dronesUnderCommand.begin() + n);
+                std::cerr << "Removing drone from command.\r\n";
 
                 //If we just removed the last drone, abort the mission - this makes it unnecessary to have an extra UI control
                 //to cancel a mission that has effectively already been canceled through the removal of all drones.
                 if (m_dronesUnderCommand.empty()) {
                     m_running = false;
-                    m_currentDroneMissions.clear();
+                    //m_currentDroneMissions.clear();
                     m_surveyRegion.Clear();
                 }
 
                 return true;
             }
+        }
+        return false;
+    }
+
+    bool GuidanceEngine::IsCommandingDrone(std::string const & Serial) {
+    	std::scoped_lock lock(m_mutex);
+    	if (! m_running)
+            return false;
+        for (size_t n = 0U; n < m_dronesUnderCommand.size(); n++) {
+            if (m_dronesUnderCommand[n]->GetDroneSerial() == Serial)
+            	return true;
         }
         return false;
     }
@@ -114,18 +138,19 @@ namespace Guidance {
     }
 
     // TODO: Move this function to a place that makes more sense (i.e., Utilities)
-    static void print_vec(std::string const & name, std::vector<int> & v) {
+    /*static void print_vec(std::string const & name, std::vector<int> & v) {
         std::cout << name << "< ";
         for (auto x : v) {
             std::cout << x << " ";
         }
         std::cout << ">";
-    }
+    }*/
 
-    void GuidanceEngine::RefreshDronePositions(void) {
-        m_droneStartPositions.clear();
+    /*void GuidanceEngine::GetDroneCurrentPositions(std::vector<DroneInterface::Waypoint> & DronePositions) {
+        DronePositions.clear();
+        DronePositions.reserve(m_dronesUnderCommand.size());
 
-        // update drone "start positions" with current position
+        //Get a waypoint object for the drones current position
         for (auto drone : m_dronesUnderCommand) {
             DroneInterface::Drone::TimePoint Timestamp;
             double Latitude, Longitude, Altitude, HAG;
@@ -137,12 +162,12 @@ namespace Guidance {
             Waypoint.Longitude = Longitude;
             Waypoint.RelAltitude = HAG;
 
-            m_droneStartPositions.push_back(Waypoint);
+            DronePositions.push_back(Waypoint);
         }
-    }
+    }*/
 
     // Decides whether sequence should be updated or not, and if so, executes those missions
-    void GuidanceEngine::RefreshSequence(void) {
+    /*void GuidanceEngine::RefreshSequence(void) {
         std::vector<int> currentMissionIndices, newMissionIndices;
 
         // Get the mission indices that are currently being flown by drones and print them out
@@ -153,39 +178,43 @@ namespace Guidance {
                 // if mission index of drone is less than size of assigned sequence
                 if ((int) m_subregionSequences[i].size() > missionIndex) {
                     currentMissionIndices.push_back(m_subregionSequences[i][missionIndex]);
-                } else {
-                    currentMissionIndices.push_back(-1); // -1 indicates that this drone is done flying missions
                 }
+                else
+                    currentMissionIndices.push_back(-1); // -1 indicates that this drone is done flying missions
                 std::cout << currentMissionIndices[i] << " ";
             }
             std::cout << std::endl;
         }
 
         m_flyingMissionStatus.clear();
-        RefreshDronePositions();
 
-        int currentSequenceCoverageExpected = 0, newSequenceCoverageExpected, currentStartUnclouded, newStartUnclouded;
+        std::vector<DroneInterface::Waypoint> droneCurrentPositions;
+        GetDroneCurrentPositions(droneCurrentPositions);
+
+        int currentSequenceCoverageExpected = 0;
+        int newSequenceCoverageExpected     = 0;
+        int currentStartUnclouded           = 0;
+        int newStartUnclouded               = 0;
         std::vector<std::vector<int>> currentSequences = m_subregionSequences;
         std::vector<int> PredictedCoverage, MissionDurations;
 
         m_subregionSequences.clear();
         static int prevNumMissions = 0;
         // Select subregion sequences
-        SelectSubregionSequences(m_TA, m_droneMissions, m_droneStartPositions, m_missionIndicesToAssign, m_subregionSequences, m_ImagingReqs);
+        SelectSubregionSequences(m_TA, m_droneMissions, droneCurrentPositions, m_missionIndicesToAssign, m_subregionSequences, m_MissionParams);
         std::cout << "Size of mission indices: " << m_missionIndicesToAssign.size() << std::endl;
 
         // Below, we compare coverage of new best sequence to recalculate coverage (based on updated m_TA) of the previous best found sequence
         // We only care about comparison of new coverage to old coverage if old coverage > 0 (because why would we care if it was 0 before? anything would be better than that)
         if (m_coverageExpected > 0) {
-            currentSequenceCoverageExpected = GetCoverage(PredictedCoverage, MissionDurations, m_TA, m_droneMissions, currentSequences, m_droneStartPositions, m_ImagingReqs, m_dronesUnderCommand.size());
+            currentSequenceCoverageExpected = GetCoverage(PredictedCoverage, MissionDurations, m_TA, m_droneMissions, currentSequences, droneCurrentPositions, m_MissionParams, m_dronesUnderCommand.size());
             currentStartUnclouded = std::accumulate(PredictedCoverage.begin(), PredictedCoverage.end(), 0);
             PredictedCoverage.clear();
             MissionDurations.clear();
         }
-        newSequenceCoverageExpected = GetCoverage(PredictedCoverage, MissionDurations, m_TA, m_droneMissions, m_subregionSequences, m_droneStartPositions, m_ImagingReqs, m_dronesUnderCommand.size());
+        newSequenceCoverageExpected = GetCoverage(PredictedCoverage, MissionDurations, m_TA, m_droneMissions, m_subregionSequences, droneCurrentPositions, m_MissionParams, m_dronesUnderCommand.size());
         newStartUnclouded = std::accumulate(PredictedCoverage.begin(), PredictedCoverage.end(), 0);
         std::cout << "current coverage: " << currentSequenceCoverageExpected << ", new coverage: " << newSequenceCoverageExpected << std::endl;
-        
 
         std::cout << "current sequence: <";
         for (auto sequence : currentSequences) {
@@ -212,7 +241,7 @@ namespace Guidance {
 
 
         // If the number of missions left to assign has changed (i.e., mission was completed), or if using new m_TA, new sequence coverage > old sequence coverage
-        if (((m_missionIndicesToAssign.size() != prevNumMissions) && !isPermutation) || 
+        if ((((int) m_missionIndicesToAssign.size() != prevNumMissions) && !isPermutation) || 
             newSequenceCoverageExpected > currentSequenceCoverageExpected || 
             (newSequenceCoverageExpected == currentSequenceCoverageExpected && newStartUnclouded > currentStartUnclouded)) {
             m_currentDroneMissions.clear();
@@ -247,7 +276,8 @@ namespace Guidance {
                     DroneInterface::WaypointMission Mission = std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]);
                     if (startMissionFromBeginning[i]) { // only start mission again if flag for starting mission from the beginning is set
                         std::cout << "Starting mission " << i << " from beginning." << std::endl;
-                        drone->ExecuteWaypointMission(Mission);
+                        TaskDroneWithMission(drone, Mission);
+                        //drone->ExecuteWaypointMission(Mission);
                     }
                     m_flyingMissionStatus.push_back(true);
                 } else {
@@ -260,14 +290,320 @@ namespace Guidance {
             m_subregionSequences = currentSequences;
         }
         prevNumMissions = m_missionIndicesToAssign.size();
+    }*/
+
+    //Clear mission prep data and periodically updated fields
+    void GuidanceEngine::ResetIntermediateData(void) {
+        m_surveyRegionPartition.clear();
+        m_droneMissions.clear();
+        m_droneAllowedTakeoffTimes.clear();
+        m_droneHAGs.clear();
+        m_droneStates.clear();
+        m_dronePositions.clear();
+        m_availableMissionIndices.clear();
+
+        //m_currentDroneMissions.clear();
+        //m_coverageExpected = 0;
+        //m_missionIndicesToAssign.clear();
+        //m_subregionSequences.clear();
+        //m_flyingMissionStatus.clear();
+        //m_wasPredictedToFinishWithoutShadows.clear();
     }
 
-    inline void GuidanceEngine::ModuleMain(void) {
-        // float refresh_period = 35.0;
-        float refresh_period = 10.0;
-        std::chrono::time_point<std::chrono::steady_clock> MostRecentSequenceTimestamp = std::chrono::steady_clock::now();
+	void GuidanceEngine::UpdateDronePositions(void) {
+		for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+			std::string serial = drone->GetDroneSerial();
+			double Lat = 0.0;
+			double Lon = 0.0;
+			double Alt = 0.0;
+			TimePoint Timestamp;
+			if (drone->GetPosition(Lat, Lon, Alt, Timestamp))
+				m_dronePositions[serial] = Eigen::Vector3d(Lat, Lon, Alt);
+			else
+				m_dronePositions[serial] = Eigen::Vector3d(0.0, 0.0, 0.0); //Not great, but this is what the drone defaults to anyways
+		}
+	}
 
+    //Do mission prep work, if necessary
+    void GuidanceEngine::MissionPrepWork(int PartitioningMethod) {
+        if (! m_missionPrepDone) {
+            //TODO: Copy any internal data needed for planning work, then unlock out mutex while we do the planning
+            //Re-lock and copy the results when done. This will prevent the UI from locking up if the prep work takes
+            //a non-trivial amount of time. Once done, we can also use the message overlay box to communicate state during prep.
+
+            std::cerr << "Doing mission preparation work.\r\n\r\n";
+            //MapWidget::Instance().m_messageBoxOverlay.AddMessage("Preparing mission for execution..."s, m_MessageToken1);
+
+            //Partition the survey region into components
+            m_surveyRegionPartition.clear();
+            if (PartitioningMethod == 0)
+                PartitionSurveyRegion_TriangleFusion(m_surveyRegion, m_surveyRegionPartition, m_MissionParams);
+            else if (PartitioningMethod == 1)
+                PartitionSurveyRegion_IteratedCuts(m_surveyRegion, m_surveyRegionPartition, m_MissionParams);
+            else
+                std::cerr << "Error: Unrecognized partitioning method. Skipping partitioning.\r\n";
+            MapWidget::Instance().m_guidanceOverlay.SetSurveyRegionPartition(m_surveyRegionPartition);
+
+            //Plan missions for each component of the partition
+            m_droneMissions.clear();
+            m_droneMissions.reserve(m_surveyRegionPartition.size());
+            for (auto const & component : m_surveyRegionPartition) {
+                DroneInterface::WaypointMission Mission;
+                PlanMission(component, Mission, m_MissionParams);
+                m_droneMissions.push_back(Mission);
+            }
+            MapWidget::Instance().m_guidanceOverlay.SetMissions(m_droneMissions);
+
+            //Initialize states, and available indices
+            m_droneStates.clear();
+            m_dronePositions.clear();
+            m_availableMissionIndices.clear();
+            TimePoint NowTime = std::chrono::steady_clock::now();
+            for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+                std::string serial = drone->GetDroneSerial();
+                bool isFlying = false;
+                TimePoint isFlyingTimestamp;
+                if (drone->IsCurrentlyFlying(isFlying, isFlyingTimestamp) && (SecondsElapsed(isFlyingTimestamp) <= 4.0)) {
+                    if (isFlying)
+                        m_droneStates[serial] = std::make_tuple(1, -1, NowTime); //Loitering (available for tasking anyhow)
+                    else
+                        m_droneStates[serial] = std::make_tuple(0, -1, NowTime); //On ground and available for tasking
+                }
+                else {
+                    std::cerr << "Bad or old telemetry for drone " << serial << ". Treating as on ground.\r\n";
+                    m_droneStates[serial] = std::make_tuple(0, -1, NowTime); //On ground and available for tasking
+                }
+            }
+            for (int missionIndex = 0; missionIndex < (int) m_droneMissions.size(); missionIndex++) {
+            	//Mark all non-trivial missions as available
+            	if (! m_droneMissions[missionIndex].Waypoints.empty())
+            		m_availableMissionIndices.insert(missionIndex);
+            }
+
+           /* for (size_t i = 0; i < m_droneMissions.size(); i++) {
+                m_missionIndicesToAssign.insert(i);  
+            }
+
+            for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
+                m_wasPredictedToFinishWithoutShadows.push_back(true);
+            }
+
+            m_coverageExpected = 0;*/
+            //RefreshSequence(); //TODO: Can hang apparently
+
+            //Populate the allowed takeoff times for all drones (use now for drones in the air) and populate
+            //the HAGs to use (m) per drone. These override mission HAG since we want height to be fixed per drone and not per mission
+            TimePoint nextAllowedTakeoffTime = std::chrono::steady_clock::now();
+            double nextAllowedHAG = m_MissionParams.HAG;
+            if (m_dronesUnderCommand.size() > 1U)
+            	nextAllowedHAG += 0.5*(m_MissionParams.HeightStaggerInterval*double(m_dronesUnderCommand.size() - 1U));
+            for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+                std::string serial = drone->GetDroneSerial();
+                bool isFlying = false;
+                TimePoint isFlyingTimestamp;
+                if (drone->IsCurrentlyFlying(isFlying, isFlyingTimestamp) && (SecondsElapsed(isFlyingTimestamp) <= 4.0)) {
+                    //Nothing unusual here - telemetry is recent
+                    if (isFlying)
+                        m_droneAllowedTakeoffTimes[serial] = std::chrono::steady_clock::now();
+                    else {
+                        m_droneAllowedTakeoffTimes[serial] = nextAllowedTakeoffTime;
+                        nextAllowedTakeoffTime = AdvanceTimepoint(nextAllowedTakeoffTime, m_MissionParams.TakeoffStaggerInterval);
+                    }   
+                }
+                else {
+                    std::cerr << "Bad or old telemetry for drone " << serial << ". Treating as on ground.\r\n";
+                    m_droneAllowedTakeoffTimes[serial] = nextAllowedTakeoffTime;
+                    nextAllowedTakeoffTime = AdvanceTimepoint(nextAllowedTakeoffTime, m_MissionParams.TakeoffStaggerInterval);
+                }
+                m_droneHAGs[serial] = nextAllowedHAG;
+                nextAllowedHAG -= m_MissionParams.HeightStaggerInterval;
+            }
+
+            m_missionPrepDone = true; //Mark the prep work as done
+            //MapWidget::Instance().m_messageBoxOverlay.RemoveMessage(m_MessageToken1);
+        }
+    }
+
+    void GuidanceEngine::TaskDroneWithMission(DroneInterface::Drone * MyDrone, DroneInterface::WaypointMission Mission) {
+        //Override mission HAG with the HAG associated with this drone
+        std::string serial = MyDrone->GetDroneSerial();
+        if (m_droneHAGs.count(serial) > 0U) {
+            double newHAG = m_droneHAGs.at(serial);
+            for (auto & WP : Mission.Waypoints)
+                WP.RelAltitude = newHAG;
+        }
+        else
+            std::cerr << "Warning: Tasking drone that wasn't part of pre-mission plan. Not overriding HAG.\r\n";
+        MyDrone->ExecuteWaypointMission(Mission);
+    }
+
+    //Check each drone that was tasked with a mission to see if it is done with it and update m_droneStates accordingly
+    void GuidanceEngine::UpdateDroneStatesBasedOnMissionProgress(void) {
+    	//If a drone was tasked with a mission and it finished it, mark the drone as loitering
+    	for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+            std::string serial = drone->GetDroneSerial();
+            bool isFlying = false;
+            bool isDoingMission = false;
+            TimePoint TimestampA, TimestampB;
+            if (drone->IsCurrentlyFlying(isFlying, TimestampA) &&
+                drone->IsCurrentlyExecutingWaypointMission(isDoingMission, TimestampB) &&
+                (SecondsElapsed(TimestampA) <= 5.0) && (SecondsElapsed(TimestampB) <= 5.0)) {
+				//We have telemetry
+				auto lastState = m_droneStates.at(serial);
+				if (std::get<0>(lastState) == 2) {
+					//Drone was tasked with a mission but it hasn't started yet
+					if (isFlying && isDoingMission) {
+						std::cerr << "Updating state for drone " << serial << " due to mission start.\r\n";
+						std::get<0>(m_droneStates.at(serial)) = 3;
+						std::get<2>(m_droneStates.at(serial)) = std::chrono::steady_clock::now();
+					}
+				}
+				else if (std::get<0>(lastState) == 3) {
+					//Drone was flying a mission
+					if ((! isFlying) || (! isDoingMission)) {
+						//Drone is no longer flying the mission
+						std::cerr << "Updating state for drone " << serial << " due to sub-region completion.\r\n";
+						if (! isFlying)
+							m_droneStates.at(serial) = std::make_tuple(0, -1, std::chrono::steady_clock::now());
+						else
+							m_droneStates.at(serial) = std::make_tuple(1, -1, std::chrono::steady_clock::now());
+					}
+				}
+            }
+        }
+    }
+
+    std::vector<DroneInterface::Drone *> GuidanceEngine::GetDronesAvailableForTasking(void) {
+        //A drone is available if it's on the ground and it's past the allowed takeoff time, or if it's in the air but not
+        //flying a mission right now (loitering)
+        std::vector<DroneInterface::Drone *> availableDrones;
+        TimePoint currentTime = std::chrono::steady_clock::now();
+        for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+            std::string serial = drone->GetDroneSerial();
+            if ((std::get<0>(m_droneStates.at(serial)) == 0) && (currentTime > m_droneAllowedTakeoffTimes.at(serial)))
+            	availableDrones.push_back(drone);
+            else if (std::get<0>(m_droneStates.at(serial)) == 1)
+            	availableDrones.push_back(drone);
+        }
+        return availableDrones;
+    }
+
+    //Task a drone to an available mission and update states accordingly
+    void GuidanceEngine::TaskDroneToAvailableMission(DroneInterface::Drone * DroneToTask) {
+    	//Stupid right now - grab any mission
+    	if (! m_availableMissionIndices.empty()) {
+    		//int missionIndex = *(m_availableMissionIndices.begin());
+    		//m_availableMissionIndices.erase(missionIndex);
+    		//TaskDroneWithMission(DroneToTask, m_droneMissions[missionIndex]);
+    		//m_droneStates.at(DroneToTask->GetDroneSerial()) = std::make_tuple(1, missionIndex, std::chrono::steady_clock::now());
+
+    		//Only consider non-trivial and viable missions and then pick the closest one
+    		std::string serial = DroneToTask->GetDroneSerial();
+    		Eigen::Vector3d droneLLA = m_dronePositions.at(serial);
+    		DroneInterface::Waypoint currentPos;
+    		currentPos.Latitude = droneLLA(0);
+    		currentPos.Longitude = droneLLA(1);
+    		currentPos.RelAltitude = 0.0;
+    		std::vector<int> availableRegionIndices(m_availableMissionIndices.begin(), m_availableMissionIndices.end());
+    		std::vector<double> travelTimes(availableRegionIndices.size(), std::nan(""));
+    		for (size_t n = 0U; n < availableRegionIndices.size(); n++) {
+    			int regionIndex = availableRegionIndices[n];
+    			if (! m_droneMissions[regionIndex].Waypoints.empty()) {
+    				DroneInterface::Waypoint WP0 = m_droneMissions[regionIndex].Waypoints[0];
+    				double timeToReachRegion = EstimateMissionTime(currentPos, WP0, m_MissionParams.TargetSpeed);
+    				TimePoint missionStartTime = AdvanceTimepoint(std::chrono::steady_clock::now(), timeToReachRegion);
+    				double margin;
+    				if (IsPredictedToFinishWithoutShadows(m_TA, m_droneMissions[regionIndex], 0.0, missionStartTime, margin))
+    					travelTimes[n] = timeToReachRegion; //Record the time it will take to get to the region
+    			}
+    		}
+
+    		int bestRegionIndex = -1;
+    		double shortestTravelTime = std::nan("");
+    		int numViableRegions = 0;
+    		for (size_t n = 0U; n < availableRegionIndices.size(); n++) {
+    			if (! std::isnan(travelTimes[n])) {
+    				//Region is viable
+    				if ((bestRegionIndex < 0) || (travelTimes[n] < shortestTravelTime)) {
+    					bestRegionIndex = availableRegionIndices[n];
+    					shortestTravelTime = travelTimes[n];
+    					numViableRegions++;
+    				}
+    			}
+    		}
+    		std::cerr << "Num viable regions: " << numViableRegions << "\r\n";
+
+    		if (bestRegionIndex >= 0) {
+    			//There is sub-region we may be able to fly - task drone
+	    		m_availableMissionIndices.erase(bestRegionIndex);
+	    		TaskDroneWithMission(DroneToTask, m_droneMissions[bestRegionIndex]);
+	    		m_droneStates.at(DroneToTask->GetDroneSerial()) = std::make_tuple(2, bestRegionIndex, std::chrono::steady_clock::now());
+    		}
+    	}
+    }
+
+    void GuidanceEngine::UpdateGuidanceOverlayWithMissionSequences(void) {
+    	std::vector<std::vector<int>> Sequences;
+    	for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+            std::string serial = drone->GetDroneSerial();
+            if (std::get<0>(m_droneStates.at(serial)) > 1)
+            	Sequences.emplace_back(1, std::get<1>(m_droneStates.at(serial)));
+            else
+            	Sequences.emplace_back();
+        }
+    	MapWidget::Instance().m_guidanceOverlay.SetDroneMissionSequences(Sequences);
+    }
+
+    bool GuidanceEngine::AreAnyDronesTaskedWithOrFlyingMissions(void) {
+    	for (auto const & kv : m_droneStates) {
+    		if (std::get<0>(kv.second) > 1)
+    			return true;
+    	}
+    	return false;
+    }
+
+    void GuidanceEngine::AbortMissionsPredictedToGetHitWithShadows(void) {
+    	for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
+            std::string serial = drone->GetDroneSerial();
+            if (std::get<0>(m_droneStates.at(serial)) > 1) {
+            	//Drone is tasked with or flying a mission right now
+            	int missionIndex = std::get<1>(m_droneStates.at(serial));
+            	double timeIntoMission = SecondsElapsed(std::get<2>(m_droneStates.at(serial)));
+
+            	//Since we don't have access to the drones internal tracking of mission progress,
+            	//we estimate it crudely based on the amount of time the drone has been flying the mission
+            	double currentProgressFraction = std::min(timeIntoMission/m_MissionParams.SubregionTargetFlightTime, 1.0);
+            	size_t lastWaypointIndex = std::max(m_droneMissions[missionIndex].Waypoints.size(), size_t(1)) - size_t(1);
+            	double currentWaypoint = currentProgressFraction * double(lastWaypointIndex);
+
+            	double margin = 0.0;
+                bool willFinish = IsPredictedToFinishWithoutShadows(m_TA, m_droneMissions[missionIndex], currentWaypoint, std::chrono::steady_clock::now(), margin);
+                if (! willFinish) {
+					DroneInterface::WaypointMission LoiterMission;
+					LoiterMission.Waypoints.push_back(m_droneMissions[missionIndex].Waypoints[0]);
+					LoiterMission.LandAtLastWaypoint = false;
+					TaskDroneWithMission(drone, LoiterMission);
+					m_droneStates.at(drone->GetDroneSerial()) = std::make_tuple(1, -1, std::chrono::steady_clock::now());
+					m_availableMissionIndices.insert(missionIndex); //Mark the mission as available again
+                }
+            }
+        }
+    }
+
+    void GuidanceEngine::ModuleMain(void) {
+        // float refresh_period = 35.0;
+        //float refresh_period = 1.0; //Check up on progress and look to re-task every this many seconds
+        //auto MostRecentSequenceTimestamp = AdvanceTimepoint(std::chrono::steady_clock::now(), -1.0*refresh_period);
+
+
+    	double AnalysisPeriod = 1.0; //Analyse drone tasking every this many seconds
+    	TimePoint LastAnalysisTP = AdvanceTimepoint(std::chrono::steady_clock::now(), -1.0*AnalysisPeriod);
         while (! m_abort) {
+            //Grab any settings that we may need before starting the loop - ensure we don't hold a lock on m_mutex while locking the options mutex
+            ProgOptions::Instance()->OptionsMutex.lock();
+            int partitioningMethod = ProgOptions::Instance()->SurveyRegionPartitioningMethod;
+            ProgOptions::Instance()->OptionsMutex.unlock();
+
             m_mutex.lock();
             if (! m_running) {
                 MapWidget::Instance().m_messageBoxOverlay.RemoveMessage(m_MessageToken1);
@@ -279,119 +615,128 @@ namespace Guidance {
             }
             
             //We are running - see if we have done the prep work yet. If not, do all the initial setup work that needs to be done
-            if (! m_missionPrepDone) {
-                double TargetFlightTime = 100;
+            MissionPrepWork(partitioningMethod);
 
-                PartitionSurveyRegion(m_surveyRegion, m_surveyRegionPartition, TargetFlightTime, m_ImagingReqs);
-
-                for (auto partition : m_surveyRegionPartition) {
-                    DroneInterface::WaypointMission Mission;
-                    PlanMission(partition, Mission, m_ImagingReqs);
-                    m_droneMissions.push_back(Mission);
-                }
-
-                for (size_t i = 0; i < m_droneMissions.size(); i++) {
-                    m_missionIndicesToAssign.insert(i);  
-                }
-
-                for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
-                    m_wasPredictedToFinishWithoutShadows.push_back(true);
-                }
-
-                m_coverageExpected = 0;
-                RefreshSequence();
-
-                m_missionPrepDone = true; //Mark the prep work as done
-            }
+            //Update our record of drone positions
+            UpdateDronePositions();
 
             //Make sure we have the most recent TA function (if any are available)
             std::chrono::time_point<std::chrono::steady_clock> newTimestamp;
             if (ShadowPropagation::ShadowPropagationEngine::Instance().GetTimestampOfMostRecentTimeAvailFun(newTimestamp)) {
                 //A TA function is available and we now have it's timestamp
-                if ((!m_TA_initialized) || (newTimestamp > m_TA.Timestamp)) {
+                if (newTimestamp > m_TA.Timestamp)
                     ShadowPropagation::ShadowPropagationEngine::Instance().GetMostRecentTimeAvailFun(m_TA);
-                    m_TA_initialized = true;
-                }
             }
+
+            if (SecondsElapsed(LastAnalysisTP) > AnalysisPeriod) {
+	            //Record the time of this analysis
+	            LastAnalysisTP = std::chrono::steady_clock::now();
+
+	            //Abort any missions that won't finish before shadows hit the region
+	            AbortMissionsPredictedToGetHitWithShadows();
+
+	            //Update drone states based on starting or ending tasked missions
+	            UpdateDroneStatesBasedOnMissionProgress();
+
+	            //If there are any drones available for tasking, task them
+	            std::vector<DroneInterface::Drone *> dronesForTasking = GetDronesAvailableForTasking();
+	            for (DroneInterface::Drone * drone : dronesForTasking)
+	            	TaskDroneToAvailableMission(drone);
+
+	            UpdateGuidanceOverlayWithMissionSequences();
+
+	            //Check to see if the mission is complete
+	            if ((m_availableMissionIndices.empty()) && (! AreAnyDronesTaskedWithOrFlyingMissions()))
+	            	m_running = false;
+        	}
+
+
+
+
+
+
 
             //Debug Only - update partition labels with whether or not each component would be finished before shadows if started now
-            std::vector<std::string> partitionLabels;
-            partitionLabels.reserve(m_surveyRegionPartition.size());
-            for (size_t compIndex = 0U; compIndex < m_surveyRegionPartition.size(); compIndex++) {
-                double margin = 0.0;
-                bool willFinish = IsPredictedToFinishWithoutShadows(m_TA, m_droneMissions[compIndex], 0.0, std::chrono::steady_clock::now(), margin);
-                std::ostringstream out;
-                out << (willFinish ? "Will Finish" : "Will Not Finish")
-                    << "\nMargin: " << std::fixed << std::setprecision(1) << margin;
-                partitionLabels.push_back(out.str());
-            }
-            MapWidget::Instance().m_guidanceOverlay.SetPartitionLabels(partitionLabels);
+            // std::vector<std::string> partitionLabels;
+            // partitionLabels.reserve(m_surveyRegionPartition.size());
+            // for (size_t compIndex = 0U; compIndex < m_surveyRegionPartition.size(); compIndex++) {
+            //     double margin = 0.0;
+            //     bool willFinish = IsPredictedToFinishWithoutShadows(m_TA, m_droneMissions[compIndex], 0.0, std::chrono::steady_clock::now(), margin);
+            //     std::ostringstream out;
+            //     out << (willFinish ? "Will Finish" : "Will Not Finish")
+            //         << "\nMargin: " << std::fixed << std::setprecision(1) << margin;
+            //     partitionLabels.push_back(out.str());
+            // }
+            // MapWidget::Instance().m_guidanceOverlay.SetPartitionLabels(partitionLabels);
 
-            std::chrono::time_point<std::chrono::steady_clock> NowTimestamp = std::chrono::steady_clock::now();
-            if (SecondsElapsed(MostRecentSequenceTimestamp, NowTimestamp) > refresh_period) {
-                    std::cout << "\nREFRESHING SEQUENCE" << std::endl;
-                    RefreshSequence();
-                    MostRecentSequenceTimestamp = std::chrono::steady_clock::now();
-            }
+            // std::chrono::time_point<std::chrono::steady_clock> NowTimestamp = std::chrono::steady_clock::now();
+            // if (SecondsElapsed(MostRecentSequenceTimestamp, NowTimestamp) > refresh_period) {
+            //         std::cout << "\nREFRESHING SEQUENCE" << std::endl;
+            //         RefreshSequence();
+            //         MostRecentSequenceTimestamp = std::chrono::steady_clock::now();
+            // }
 
-            for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
-                bool Result;
-                DroneInterface::Drone::TimePoint Timestamp;
-                auto drone = m_dronesUnderCommand[i];
-                drone->IsCurrentlyExecutingWaypointMission(Result, Timestamp);
+            // for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
+            //     bool Result;
+            //     DroneInterface::Drone::TimePoint Timestamp;
+            //     auto drone = m_dronesUnderCommand[i];
+            //     drone->IsCurrentlyExecutingWaypointMission(Result, Timestamp);
     
-                // if flying --> not flying transition detected
-                // also, only retask/increment mission if not currently flying "OneWaypointMission" (see below)
-                if ((Result != m_flyingMissionStatus[i]) && (Result == false) && m_wasPredictedToFinishWithoutShadows[i]) {
-                    int currentMissionIndex = m_subregionSequences[i][std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()])++];
-                    m_missionIndicesToAssign.erase(currentMissionIndex);
-                    if ((int) m_subregionSequences[i].size() > std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()])) {
-                        int missionIndex = m_subregionSequences[i][std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()])];
-                        std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]) = m_droneMissions[missionIndex];
-                        DroneInterface::WaypointMission Mission = std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]);
-                        drone->ExecuteWaypointMission(Mission);
-                    }
-                }
-                m_flyingMissionStatus[i] = Result;
-            }
+            //     // if flying --> not flying transition detected
+            //     // also, only retask/increment mission if not currently flying "OneWaypointMission" (see below)
+            //     if ((Result != m_flyingMissionStatus[i]) && (Result == false) && m_wasPredictedToFinishWithoutShadows[i]) {
+            //         int currentMissionIndex = m_subregionSequences[i][std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()])++];
+            //         m_missionIndicesToAssign.erase(currentMissionIndex);
+            //         if ((int) m_subregionSequences[i].size() > std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()])) {
+            //             int missionIndex = m_subregionSequences[i][std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()])];
+            //             std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]) = m_droneMissions[missionIndex];
+            //             DroneInterface::WaypointMission Mission = std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]);
+            //             //drone->ExecuteWaypointMission(Mission);
+            //             TaskDroneWithMission(drone, Mission);
+            //         }
+            //     }
+            //     m_flyingMissionStatus[i] = Result;
+            // }
 
-            RefreshDronePositions();
+            // //RefreshDronePositions();
 
-            std::chrono::time_point<std::chrono::steady_clock> DroneStartTime = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
-                auto drone = m_dronesUnderCommand[i];
-                double Margin;
+            // std::chrono::time_point<std::chrono::steady_clock> DroneStartTime = std::chrono::steady_clock::now();
+            // for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
+            //     auto drone = m_dronesUnderCommand[i];
+            //     double Margin;
                               
-                int missionIndex = std::get<0>(m_currentDroneMissions[m_dronesUnderCommand[i]->GetDroneSerial()]);
-                if (missionIndex < m_subregionSequences[i].size()) {
-                    DroneInterface::WaypointMission Mission = std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]);
-                    bool willFinish = IsPredictedToFinishWithoutShadows(m_TA, Mission, 0, DroneStartTime, Margin);
-                    if (m_wasPredictedToFinishWithoutShadows[i] && !willFinish) { // falling edge
-                        std::cout << "At drone idx " << i << ", a falling edge was detected; hovering at first waypoint";
-                        DroneInterface::WaypointMission OneWaypointMission;
-                        OneWaypointMission.Waypoints.push_back(Mission.Waypoints[0]);
-                        OneWaypointMission.LandAtLastWaypoint = false;
-                        drone->ExecuteWaypointMission(OneWaypointMission);
-                    } else if (!m_wasPredictedToFinishWithoutShadows[i] && willFinish) { // rising edge
-                        std::cout << "At drone idx " << i << ", a rising edge was detected; starting waypoint mission from beginning";
-                        drone->ExecuteWaypointMission(Mission);
-                    }
-                    m_wasPredictedToFinishWithoutShadows[i] = willFinish;
-                }
+            //     int missionIndex = std::get<0>(m_currentDroneMissions[m_dronesUnderCommand[i]->GetDroneSerial()]);
+            //     if (missionIndex < (int) m_subregionSequences[i].size()) {
+            //         DroneInterface::WaypointMission Mission = std::get<1>(m_currentDroneMissions[drone->GetDroneSerial()]);
+            //         bool willFinish = IsPredictedToFinishWithoutShadows(m_TA, Mission, 0, DroneStartTime, Margin);
+            //         if (m_wasPredictedToFinishWithoutShadows[i] && !willFinish) { // falling edge
+            //             std::cout << "At drone idx " << i << ", a falling edge was detected; hovering at first waypoint";
+            //             DroneInterface::WaypointMission OneWaypointMission;
+            //             OneWaypointMission.Waypoints.push_back(Mission.Waypoints[0]);
+            //             OneWaypointMission.LandAtLastWaypoint = false;
+            //             //drone->ExecuteWaypointMission(OneWaypointMission);
+            //             TaskDroneWithMission(drone, OneWaypointMission);
+            //         } else if (!m_wasPredictedToFinishWithoutShadows[i] && willFinish) { // rising edge
+            //             std::cout << "At drone idx " << i << ", a rising edge was detected; starting waypoint mission from beginning";
+            //             //drone->ExecuteWaypointMission(Mission);
+            //             TaskDroneWithMission(drone, Mission);
+            //         }
+            //         m_wasPredictedToFinishWithoutShadows[i] = willFinish;
+            //     }
 
-            }
+            // }
 
-            // Track incomplete missions for the sake of turning completed missions blue in guidance overlay.
-            std::vector<std::vector<int>> m_subregionSequencesIncomplete;
-            for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
-                auto drone = m_dronesUnderCommand[i];
-                int missionNum = std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()]);
-                std::vector<int> incompleteMissions(m_subregionSequences[i].begin() + missionNum, m_subregionSequences[i].end());
-                m_subregionSequencesIncomplete.push_back(incompleteMissions);
-            }
+            // // Track incomplete missions for the sake of turning completed missions blue in guidance overlay.
+            // std::vector<std::vector<int>> m_subregionSequencesIncomplete;
+            // for (size_t i = 0; i < m_dronesUnderCommand.size(); i++) {
+            //     auto drone = m_dronesUnderCommand[i];
+            //     int missionNum = std::get<0>(m_currentDroneMissions[drone->GetDroneSerial()]);
+            //     std::vector<int> incompleteMissions(m_subregionSequences[i].begin() + missionNum, m_subregionSequences[i].end());
+            //     m_subregionSequencesIncomplete.push_back(incompleteMissions);
+            // }
 
-            MapWidget::Instance().m_guidanceOverlay.SetMissions(m_droneMissions);
-            MapWidget::Instance().m_guidanceOverlay.SetDroneMissionSequences(m_subregionSequencesIncomplete);
+            // //TODO: Only give these to the guidance overlay when something changes.
+            // MapWidget::Instance().m_guidanceOverlay.SetDroneMissionSequences(m_subregionSequencesIncomplete);
 
 
             //If we get here we are executing a mission
@@ -433,584 +778,6 @@ namespace Guidance {
         for (int waypointIndex = 0; waypointIndex + 1 < (int) Mission.Waypoints.size(); waypointIndex++)
             totalTime += EstimateMissionTime(Mission.Waypoints[waypointIndex], Mission.Waypoints[waypointIndex+1], TargetSpeed);
         return totalTime;
-    }
-
-    //3.1 Helper Function -- Gets the "score" (estimated flight time) of a triangle based on a square.
-    double GetTriangleScore(Triangle & triangle, ImagingRequirements const & ImagingReqs){
-        //Row spacing = 2 * HAG * tan(0.5 * HFOV) * (1 - SidelapFraction) <In Meters>
-        double row_spacing = 2 * ImagingReqs.HAG * tan(0.5 * ImagingReqs.HFOV) * (1 - ImagingReqs.SidelapFraction);
-        double length = sqrt(2 * triangle.GetArea());
-        return length * (length / row_spacing) / ImagingReqs.TargetSpeed;
-    }
-
-    //3.2 Helper Function -- Recursively bisects triangles until they score less than the targeted flight time.
-    void PartitionSurveyRegionRec(Triangle & mainTriangle, std::Evector<Triangle> & allTriangles, double TargetFlightTime, ImagingRequirements const & ImagingReqs){
-        if (GetTriangleScore(mainTriangle, ImagingReqs) > TargetFlightTime){
-            //Split the triangle into two triangles
-            Triangle subTriangleA;
-            Triangle subTriangleB;
-            mainTriangle.Bisect(subTriangleA, subTriangleB);
-
-            PartitionSurveyRegionRec(subTriangleA, allTriangles, TargetFlightTime, ImagingReqs);
-            PartitionSurveyRegionRec(subTriangleB, allTriangles, TargetFlightTime, ImagingReqs);
-
-        }
-        else{
-            allTriangles.push_back(mainTriangle);
-
-        }
-    }
-
-    void PartitionTrianglesList(Triangle & mainTriangle, std::Evector<Triangle> & allTriangles, std::vector<Eigen::Vector2d> pointsList){
-        // Base case, just one point
-        if (pointsList.size() == 1){
-            Triangle subTriangleA;
-            Triangle subTriangleB;
-            mainTriangle.BisectIntersection(pointsList[0], subTriangleA, subTriangleB);
-            allTriangles.push_back(subTriangleA);
-            allTriangles.push_back(subTriangleB);
-        }
-        // other base case: empty list
-        else if (pointsList.empty()){
-            allTriangles.push_back(mainTriangle);
-        }
-
-        else{
-            Triangle subTriangleA;
-            Triangle subTriangleB;
-            std::vector<Eigen::Vector2d> pointsListA;
-            std::vector<Eigen::Vector2d> pointsListB;
-            mainTriangle.BisectIntersection(pointsList[0], subTriangleA, subTriangleB);
-
-            for (int j = 1; j < (int) pointsList.size(); j++){
-                if (subTriangleA.ToSimplePolygon().ContainsPoint(pointsList[j])){
-                    pointsListA.push_back(pointsList[j]);
-                }
-                else{
-                    pointsListB.push_back(pointsList[j]);
-                }
-            }
-            PartitionTrianglesList(subTriangleA, allTriangles,pointsListA);
-            PartitionTrianglesList(subTriangleB, allTriangles,pointsListB);
-
-        }
-    }
-
-    //3 - Take a survey region, and break it into sub-regions of similar size that can all be flown in approximately the same flight time (argument).
-    //    A good partition uses as few components as possible for a given target execution time. Hueristically, this generally means simple shapes.
-    //    This function needs the target drone speed and imaging requirements because they impact what sized region can be flown in a given amount of time.
-    //Arguments:
-    //Region           - Input  - The input survey region to cover (polygon collection in NM coords)
-    //Partition        - Output - A vector of sub-regions, each one a polygon collection in NM coords (typical case will have a single poly in each sub-region)
-    //TargetFlightTime - Input  - The approx time (in seconds) a drone should be able to fly each sub-region in, given the max vehicle speed and sidelap
-    //ImagingReqs      - Input  - Parameters specifying speed and row spacing (see definitions in struct declaration)
-
-    void PartitionSurveyRegion(PolygonCollection const & Region, std::Evector<PolygonCollection> & Partition, double TargetFlightTime, ImagingRequirements const & ImagingReqs) {
-        // *********************** MESHING SECTION **************************************************
-        //Slice the polygon into triangles.
-        std::Evector<Triangle> allTrianglesTriangulate;
-        std::Evector<Triangle> allTriangles;
-        TriangleAdjacencyMap map;
-        std::vector<std::vector<Eigen::Vector2d>> intersectionsList;
-        std::vector<Eigen::Vector2d> Intersection;
-        for(Polygon shape: Region.m_components){
-            std::Evector<Triangle> subTriangles;
-            shape.Triangulate(subTriangles);
-            for (Triangle & tri: subTriangles){
-                allTrianglesTriangulate.push_back(tri);
-            }
-        }
-
-        //Recursively slice triangles until they are smaller than the Target Flight Time.
-        for(Triangle & triangle: allTrianglesTriangulate){
-            PartitionSurveyRegionRec(triangle, allTriangles, TargetFlightTime/2, ImagingReqs);
-        }
-
-
-        allTrianglesTriangulate.clear();
-
-        intersectionsList.resize(allTriangles.size());
-
-
-        // This loop searches all triangles for vertices that cut an edge
-        // A triangle may cut an edge 0, 1, or 2 times
-        // All intersections are assembled into a list per triangle. We are trying to avoid duplicates
-        for (int i = 0; i < (int) allTriangles.size(); i++) {
-            for (int j = 0; j < (int) allTriangles.size(); j++) {
-                Intersection.clear();
-                if (i!=j && allTriangles[i].ToSimplePolygon().CheckIntersect(allTriangles[j].ToSimplePolygon(), Intersection)){
-                    //std::cout<< Intersection.size() <<" intersections found!" <<std::endl;
-                    for (auto point: Intersection){
-                        bool isUnique = true;
-                        // Checking list for existence of same point. If exists, not unique and do not add to list
-                        for (int k = 0; k < (int) intersectionsList[i].size(); k++){
-                            if ((intersectionsList[i][k] - point).norm() < TOLERANCE){
-                                isUnique = false;
-                            }
-                        }
-                        if (isUnique){
-                            //std::cout<< "Adding point! " << std::endl;
-                            intersectionsList[i].push_back(point);
-                        }
-                    }
-                    std::cout<< "Triangle " << std::to_string(i) << " has intersection with triangle " << j  << std::endl;
-                }
-            }
-        }
-
-        for (int i = 0; i < (int) intersectionsList.size(); i++) {
-            if (!intersectionsList[i].empty()){
-                std::cout<< "Triangle " << std::to_string(i) << " has intersections " << intersectionsList[i].size() << std::endl;
-            }
-        }
-
-        Triangle subTriangleA;
-        Triangle subTriangleB;
-        allTrianglesTriangulate.clear();
-        for (int i = 0; i < (int) allTriangles.size(); i++) {
-            if (intersectionsList[i].empty()){
-                allTrianglesTriangulate.push_back(allTriangles[i]);
-            }
-            else{
-
-                /*
-                 *                 for (auto point: intersectionsList[i]){
-                                    Triangle subTriangleA;
-                                    Triangle subTriangleB;
-                                    allTriangles[i].BisectIntersection(point, subTriangleA, subTriangleB);
-                                    allTrianglesTriangulate.push_back(subTriangleA);
-                                    allTrianglesTriangulate.push_back(subTriangleB);
-                                }
-                 */
-                PartitionTrianglesList(allTriangles[i], allTrianglesTriangulate, intersectionsList[i]);
-            }
-
-        }
-
-        std::vector<std::string> triangleLabels;
-
-        for (int i = 0; i < (int) allTrianglesTriangulate.size(); i++) {
-            triangleLabels.push_back(std::to_string(i));
-        }
-        //MapWidget::Instance().m_guidanceOverlay.ClearTriangleLabels();
-        //MapWidget::Instance().m_guidanceOverlay.ClearTriangles();
-        //MapWidget::Instance().m_guidanceOverlay.SetTriangles(allTrianglesTriangulate);
-        //MapWidget::Instance().m_guidanceOverlay.SetTriangleLabels(triangleLabels);
-
-        allTriangles = allTrianglesTriangulate; // ECHAI: Not great but I'm feeling lazy
-        //return;
-        //************************* END OF MESHING ****************************************
-        // Up to this point, we are guaranteed that no vertex cuts another edge!
-
-        //************************ ADJACENCY MAP CONSTRUCTION********************************
-        //Add each triangle and its edges to the map.
-
-        for (int i = 0; i < (int) allTriangles.size(); i++) {
-            TriangleAdjacencyMap::Triangle tri;
-            tri.id = i;
-            tri.score = GetTriangleScore(allTriangles[i], ImagingReqs);
-            map.nodes.push_back(tri);
-            map.edges.push_back({});
-            for (int j = 0; j < (int) allTriangles.size(); j++) {
-                if((i!=j) && allTriangles[i].ToSimplePolygon().CheckAdjacency(allTriangles[j].ToSimplePolygon())){
-                    map.edges[i].push_back(j);
-                }
-            }
-        }
-        // ****************** END OF ADJACENCY MAP CONSTRUCTION ************************************
-
-        // ****************** GROUP/PARITION CONSTRUCTION ********************************************
-        //Combine triangles greedily until adding another adjacent triangle would go above the Target Flight Time.
-        std::vector<int> groupScoreList;
-        std::vector<int> assignedGroups(allTriangles.size(), -1);
-        for (auto node: map.nodes){
-            std::vector<int> currentCandidateEdges;
-            //If the node is already in a group, ignore it
-            if (assignedGroups[node.id] != -1){
-                continue;
-            }
-
-            //Otherwise, create a group for the solo node.
-            map.groups.push_back({node.id});
-            groupScoreList.push_back(node.score);
-            assignedGroups[node.id] = map.groups.size()-1;
-
-            //Add in edges from the starting node of the group.
-            for(auto item: map.edges[node.id]){
-                currentCandidateEdges.push_back(item);
-            }
-
-            //While there are edges attached to this group, try to add them in.
-            while(currentCandidateEdges.size() > 0){
-                int n = currentCandidateEdges[0];
-                if(map.nodes[n].score + groupScoreList.back() < TargetFlightTime && assignedGroups[n] == -1){
-                    map.groups.back().push_back(map.nodes[n].id);
-                    groupScoreList.back() += map.nodes[n].score;
-                    assignedGroups[n] = map.groups.size()-1;
-                    //Add edges to currentCandidateEdges
-                    for(auto item: map.edges[n]){
-                        currentCandidateEdges.push_back(item);
-                    }
-                }
-                currentCandidateEdges.erase(currentCandidateEdges.begin());
-            }
-
-            //Now, create the new polygon & add it to its own private collection in the Evector of PolygonCollections.
-            PolygonCollection collection;
-            Polygon new_polygon;
-            std::Evector<LineSegment> list_of_segments;
-            for (auto node: map.groups.back()){
-                for (LineSegment line: allTriangles[node].ToSimplePolygon().GetLineSegments()){
-                    list_of_segments.push_back(line);
-                }
-            }
-            new_polygon.m_boundary.CustomSanitize(list_of_segments);
-            collection.m_components.push_back(new_polygon);
-            Partition.push_back(collection);
-        }
-
-        //Set labels for the grouped shapes.
-        std::vector<std::string> groupLabels;
-        std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        for (int n = 0; n < (int) map.groups.size(); n++)
-        	groupLabels.push_back(alphabet.substr(n, 1));
-
-        //Display both the triangles and the grouped polygons on Recon.
-        MapWidget::Instance().m_guidanceOverlay.ClearPartitionLabels();
-        MapWidget::Instance().m_guidanceOverlay.ClearSurveyRegionPartition();
-        MapWidget::Instance().m_guidanceOverlay.SetSurveyRegionPartition(Partition);
-        MapWidget::Instance().m_guidanceOverlay.SetPartitionLabels(groupLabels);
-
-        //Set labels for the individual triangles.
-        //std::vector<std::string> triangleLabels;
-        triangleLabels.clear();
-        for (int i = 0; i < (int) map.nodes.size(); i++) {
-            std::string fullLabel = alphabet[assignedGroups[i]] + std::to_string(i) + ":";
-            for (int j = 0; j < (int) map.edges[i].size(); j++) {
-                if (j!=0){
-                    fullLabel.append(",");
-                }
-                fullLabel.append(std::to_string(map.edges[i][j]));
-            }
-            triangleLabels.push_back(fullLabel);
-        }
-
-        MapWidget::Instance().m_guidanceOverlay.ClearTriangleLabels();
-        MapWidget::Instance().m_guidanceOverlay.ClearTriangles();
-        MapWidget::Instance().m_guidanceOverlay.SetTriangles(allTriangles);
-        MapWidget::Instance().m_guidanceOverlay.SetTriangleLabels(triangleLabels);
-
-        //(NON-IMPACTING -- FOR DEVELOPER USE ONLY) Display polygon information on the terminal.
-        std::cout<<"Target Score: " << TargetFlightTime << std::endl;
-        std::cout<<"There are " << map.nodes.size() << " nodes in the graph. This should equal the number of triangles." << std::endl;
-        std::cout<<"There are " << map.groups.size() << " groups in the graph." << std::endl;
-        //Information on individual triangles.
-        for (int i = 0; i < (int) map.nodes.size(); i++) {
-            float value = (int)(map.nodes[i].score * 100 + .5);
-            std::cout << "Edges of " << i <<" (Score " << (float)value / 100 << "; Group [" << alphabet[assignedGroups[i]] <<"]) : ";
-            for (int j = 0; j < (int) map.edges[i].size(); j++) {
-                std::cout << map.edges[i][j] << ", ";
-            }
-            std::cout << std::endl;
-        }
-        //Information on grouped triangles.
-        for (int n = 0; n < (int) map.groups.size(); n++) {
-            std::cout << "Group "<< alphabet.substr(n, 1) << " :";
-            for (auto item: map.groups[n]){
-                std::cout << " " << item;
-            }
-            std::cout << "." << std::endl;
-        }
-
-    }
-
-    Eigen::Vector2d NM2ECEF(const Eigen::Vector2d & point_NM){
-        Eigen::Vector3d tempCoordinate_LL3d;
-        Eigen::Vector3d tempCoordinate_ECEF;
-        Eigen::Vector2d point_ECEF;
-
-        Eigen::Vector2d tempC = NMToLatLon(point_NM);
-
-        tempCoordinate_LL3d << tempC(0), tempC(1), 0.0;
-        tempCoordinate_ECEF = LLA2ECEF(tempCoordinate_LL3d);
-        point_ECEF << tempCoordinate_ECEF(0), tempCoordinate_ECEF(1);
-        return  point_ECEF;
-
-    }
-
-
-    //4 - Take a region or sub-region and plan a trajectory to cover it at a given height that meets the specified imaging requirements. In this case we specify
-    //    the imaging requirements using a maximum speed and sidelap fraction.
-    //Arguments:
-    //Region      - Input  - The input survey region or sub-region to cover (polygon collection in NM coords)
-    //Mission     - Output - The planned mission that covers the input region
-    //ImagingReqs - Input  - Parameters specifying speed and row spacing (see definitions in struct declaration)
-    void PlanMission(PolygonCollection const & Region, DroneInterface::WaypointMission & Mission, ImagingRequirements const & ImagingReqs) {
-        //TODO
-        Mission.Waypoints.clear();
-        Mission.LandAtLastWaypoint = false;
-        Mission.CurvedTrajectory = true;
-        std::Evector<Eigen::Vector2d> vertices_NM;
-        std::Evector<PolygonCollection> Partition;
-
-        std::Evector<std::tuple<LineSegment, float, Eigen::Vector3f>> lineSegments;
-        std::Evector<std::tuple<LineSegment, float, Eigen::Vector3f>> hatchLinesVisualize;
-        std::Evector<std::tuple<Eigen::Vector2d, float, Eigen::Vector3f>> circles;
-
-        float lineThickness = 2.0f;
-        float circleRadius  = 6.5f;
-        Eigen::Vector3f lineColor  (0.0f, 0.8f, 0.0f);
-        Eigen::Vector3f circleColor(0.8f, 0.0f, 0.0f);
-
-        for (auto subregion: Region.m_components){
-            std::Evector<LineSegment> edges = subregion.m_boundary.GetLineSegments();
-            SimplePolygon tempPolygon;
-
-            // These variables are for the calculating the hatchlines
-            std::vector<LineSegment> hatchLines;
-            std::vector<LineSegment> hatchLines_NM;
-            LineSegment longest_edge;
-            double longest_side_length = 0.0;
-
-
-            // Finding the longest edge of the simple polygon
-            for (auto edge: edges){
-                if (edge.GetLength() > longest_side_length){
-                    longest_side_length = edge.GetLength();
-                    longest_edge = edge;
-                }
-            }
-            lineSegments.push_back(std::make_tuple(longest_edge, lineThickness, lineColor));
-            // Step 1: Rotation
-            // 1a: translation: I want to be able to view the rotation, which means this is a rotation around a point
-            // Point (x1,y1) to be rotatated around point (x2,y2)
-            // (xt, yt) = (x1,y1) - (x2,y2)
-            // angle to x-axis given by arctan(x/y)
-            // Point of rotation will be edge vertex closest to zero
-
-            Eigen::Vector2d rotationPoint; // This will be the point of rotation.
-            Eigen::Vector2d pointTranslated; // This will be the effective point to rotate
-
-            if (longest_edge.m_endpoint1.norm() < longest_edge.m_endpoint2.norm()){
-                rotationPoint = longest_edge.m_endpoint1;
-                pointTranslated = longest_edge.m_endpoint2 - longest_edge.m_endpoint1;
-            }
-            else{
-                rotationPoint = longest_edge.m_endpoint2;
-                pointTranslated = longest_edge.m_endpoint1 - longest_edge.m_endpoint2;
-            }
-            double theta = atan2(pointTranslated(1), pointTranslated(0));
-
-            // Calculating rotation matrix
-            Eigen::Matrix2d rot2D;
-            rot2D << cos(-theta), -sin(-theta),
-            sin(-theta),  cos(-theta);
-
-            // Create rotated polygon
-            vertices_NM.clear();
-            for (auto vertex: subregion.m_boundary.GetVertices()){
-                vertices_NM.push_back((rot2D *(vertex-rotationPoint))+rotationPoint);
-            }
-
-            tempPolygon.SetBoundary(vertices_NM); // Create our rotated polygon
-
-            //********************** FOR PLOTTING PURPOSES *********************************
-
-            //For visualization purposes, we are plotting original and rotated polygon
-            Partition.emplace_back(); //Create a new element in the partition
-            Partition.back().m_components.emplace_back(); //Add a component to the new element
-            Partition.back().m_components.back().m_boundary.SetBoundary(subregion.m_boundary.GetVertices());
-
-            Partition.emplace_back(); //Create a new element in the partition
-            Partition.back().m_components.emplace_back(); //Add a component to the new element
-            Partition.back().m_components.back().m_boundary.SetBoundary(vertices_NM);
-            // ****************** END OF FOR PLOTTING PURPOSES ********************
-            //****************** END OF POLYGON ROTATION **************************
-
-            //****************** POLYGON FILL *************************************
-            // Create bounding box containing our polygon
-            Eigen::Vector4d bounding_box = tempPolygon.GetAABB(); //vector (XMin, XMax, YMin, YMax)
-            Eigen::Vector2d MinMin_NM; // Store (XMin, YMin)
-            Eigen::Vector2d MaxMax_NM; // Store (XMax, YMax)
-            Eigen::Vector2d MinMin_ECEF; // Store (XMin, YMin), for debugging purposes
-            Eigen::Vector2d MaxMax_ECEF; // Store (XMax, YMax), for debugging purposes
-
-            MinMin_NM << bounding_box(0), bounding_box(2);
-            MaxMax_NM << bounding_box(1), bounding_box(3);
-            vertices_NM.clear();
-            vertices_NM.emplace_back(MinMin_NM);
-            vertices_NM.emplace_back(MaxMax_NM);
-
-            // ****************** HATCH LINE GENERATION ****************************************
-            // Fill the polygon with hatch lines
-            // 1) Figure out spacing.
-            //      1a) Convert bounding box to meters
-            //      1b) Get straight line trajectories with overlap using Imaging requirements
-
-            // 1a) Convert bounding box to meters
-
-            // 1b) Get straight line trajectories based on imaging requirements
-            // Start first hatch line half the row spacing from top of box, which is yMax
-            // Build horizontal lines until y-value is less than yMin
-            // All lines go from Xmin to Xmax
-            double rowSpacing = 2 * ImagingReqs.HAG * tan(0.5 * ImagingReqs.HFOV) * (1 - ImagingReqs.SidelapFraction);
-            double rowSpacing_NM = MetersToNMUnits(rowSpacing, MaxMax_NM(1));
-
-            // This is for debugging. Useful to understand distances in meters
-            double numHatchLines = ceil((MaxMax_ECEF(1) - MinMin_ECEF(1)- (rowSpacing/2))/rowSpacing);
-            double y_init = MaxMax_ECEF(1)-(rowSpacing/2.0);
-            numHatchLines = ceil((MaxMax_NM(1) - MinMin_NM(1)- (rowSpacing_NM/2))/rowSpacing_NM);
-            y_init = MaxMax_NM(1)-(rowSpacing_NM/2.0);
-
-
-            for (int i = 0; i<numHatchLines; i++){
-                //InputSegments.emplace_back(Eigen::Vector2d(0.0, 0.0), Eigen::Vector2d(1.0, 0.0));
-                hatchLines.emplace_back(
-                        Eigen::Vector2d(MinMin_NM(0), y_init-(i*rowSpacing_NM)),
-                        Eigen::Vector2d(MaxMax_NM(0), y_init-(i*rowSpacing_NM)));
-            }
-
-            //********************* END OF HATCHLINE GENERATION ********************************************
-
-            // ******************* GENERATE FRAGMENTED LINES FOR TRAJECTORIES ******************************
-            // Now we break the hatchlines
-            // For each hatchline
-            // 2a) Break line where it intersects with polygon edges
-            // 2b) Keep segment that is internal to polygon. Note that a line segment that might break in multiple places
-            std::Evector<LineSegment> FragmentedHatchLines;
-
-            for (auto currentHatchLine: hatchLines){
-                std::vector<Eigen::Vector2d> allIntersections;
-                bool IsInteriorA, IsInteriorB;
-
-                // For each polygon edge, collect all intersections
-                std::vector<double> m1_norm;
-                for (auto edge: tempPolygon.GetLineSegments() ){
-                    Eigen::Vector2d Intersection;
-                    if (edge.ComputeInteriorIntersection(currentHatchLine, Intersection, IsInteriorA, IsInteriorB)){
-                        allIntersections.push_back(Intersection);
-                        m1_norm.push_back((Intersection-currentHatchLine.m_endpoint1).norm());
-                    }
-                }
-                // Sort intersections according to distance to one endpoint of hatchline
-                std::vector<std::pair<double,int> >V;
-                for (int i = 0; i < (int) m1_norm.size(); i++) {
-                    std::pair<double,int>P=std::make_pair(m1_norm[i],i);
-                    V.push_back(P);
-                }
-                sort(V.begin(),V.end());
-                // V is now the intersections sorted by their norm distance to one end-point of hatchline
-
-                // Now construct line segments, keeping only those inside the polygon
-                // Guaranteed that line segment in each loop is possible shortest
-                // Therefore it is either completely inside or outside polygon
-                // Therefore the mid-point must be completely inside or outside polygon
-                for (int i = 1; i < (int) V.size(); i++) {
-                    Eigen::Vector2d midPoint = (allIntersections[V[i-1].second]+allIntersections[(V[i].second)])/2;
-                    if(tempPolygon.ContainsPoint(midPoint)){
-                        FragmentedHatchLines.push_back(LineSegment(allIntersections[V[i-1].second],allIntersections[(V[i].second)]));
-                    }
-                }
-            }
-            // ***************** FRAGMENTED LINES GENERATION COMPLETED *****************************
-
-            // For each line segment
-            //      1a) Populate waypoint vector with end points
-            //              Shift end_points inwards by 0.5*rowSpacing_NM
-            //              If line length is larger than rowspacing_NM, then the shift will result in a single point
-            //                  Populate waypoint vector with just that single midpoint
-            //              Otherwise, populate with m1 and m2
-            //      1b) Create temp sorted list of norm and index of all remaining endpoints, see example code above
-            //              The closest endpoint will be at index 0
-            //              The associated line segment will be the next line
-            //      1c) Undo the rotation of the points.
-            //            NOTE WELL!!!! This function rotates around a point that is NOT the origin
-            //            Therefore, the rotation operation is technically a translation, then rotation, then translation
-            //
-
-            //1a: Populate waypoint vector with end points
-            for (auto & line: FragmentedHatchLines){
-                if(line.GetLength() < rowSpacing_NM){
-                    LineSegment tempLine;
-                    tempLine.m_endpoint1 = (line.m_endpoint1 + line.m_endpoint2) / 2;
-                    tempLine.m_endpoint2 = tempLine.m_endpoint1;
-                    line = tempLine;
-                } else {
-                    if(line.m_endpoint1[0] > line.m_endpoint2[0]){
-                        line.m_endpoint1[0] -= 0.5*rowSpacing_NM;
-                        line.m_endpoint2[0] += 0.5*rowSpacing_NM;
-                    } else {
-                        line.m_endpoint1[0] += 0.5*rowSpacing_NM;
-                        line.m_endpoint2[0] -= 0.5*rowSpacing_NM;
-                    }
-                }
-            }
-            //1b: Create temp sorted list of norm and index of all remaining endpoints, see example code above [WARNING: UNSORTED]
-            std::vector<Eigen::Vector2d> orderedPoints;
-            std::vector<bool> hasLineBeenUsed (FragmentedHatchLines.size(), false);
-            bool isEndpointOne = true;
-            int chosenLineIndex = 0;
-            hasLineBeenUsed[0] = true;
-            orderedPoints.push_back(FragmentedHatchLines[0].m_endpoint2);
-            orderedPoints.push_back(FragmentedHatchLines[0].m_endpoint1);
-            while (std::find(hasLineBeenUsed.begin(), hasLineBeenUsed.end(), false) != hasLineBeenUsed.end()){
-                Eigen::Vector2d currentEndpoint;
-                Eigen::Vector2d chosenPoint;
-                if(isEndpointOne) currentEndpoint = FragmentedHatchLines[chosenLineIndex].m_endpoint1;
-                else currentEndpoint = FragmentedHatchLines[chosenLineIndex].m_endpoint2;
-                chosenPoint = currentEndpoint;
-                //Find the closest unused point to this one
-                for (int x = 0; x < (int) hasLineBeenUsed.size(); x++) {
-                    if(hasLineBeenUsed[x]) continue;
-                    if (chosenPoint == currentEndpoint){
-                        chosenLineIndex = x;
-                        isEndpointOne = false;
-                        chosenPoint = FragmentedHatchLines[x].m_endpoint1;
-                    }
-                    if((chosenPoint - currentEndpoint).norm() > (FragmentedHatchLines[x].m_endpoint1 - currentEndpoint).norm()) {
-                        chosenLineIndex = x;
-                        isEndpointOne = false;
-                        chosenPoint = FragmentedHatchLines[x].m_endpoint1;
-                    }
-                    if((chosenPoint - currentEndpoint).norm() > (FragmentedHatchLines[x].m_endpoint2 - currentEndpoint).norm()) {
-                        chosenLineIndex = x;
-                        isEndpointOne = true;
-                        chosenPoint = FragmentedHatchLines[x].m_endpoint2;
-                    }
-                }
-                hasLineBeenUsed[chosenLineIndex] = true;
-                if(isEndpointOne){
-                    orderedPoints.push_back(FragmentedHatchLines[chosenLineIndex].m_endpoint2);
-                    orderedPoints.push_back(FragmentedHatchLines[chosenLineIndex].m_endpoint1);
-                } else {
-                    orderedPoints.push_back(FragmentedHatchLines[chosenLineIndex].m_endpoint1);
-                    orderedPoints.push_back(FragmentedHatchLines[chosenLineIndex].m_endpoint2);
-                }
-            }
-
-            //1c: Undo Rotation of the points.
-            rot2D << cos(theta), -sin(theta),
-            sin(theta),  cos(theta);
-            for (auto & line: FragmentedHatchLines){
-                line.m_endpoint1 = (rot2D *(line.m_endpoint1-rotationPoint))+rotationPoint;
-                line.m_endpoint2 = (rot2D *(line.m_endpoint2-rotationPoint))+rotationPoint;
-            }
-            for (auto & point: orderedPoints){
-                point = (rot2D *(point-rotationPoint))+rotationPoint;
-                Eigen::Vector2d LatLonPoint;
-                LatLonPoint = NMToLatLon(point);
-                DroneInterface::Waypoint newWayPoint;
-                newWayPoint.Latitude = LatLonPoint[0];
-                newWayPoint.Longitude = LatLonPoint[1];
-                newWayPoint.RelAltitude = ImagingReqs.HAG;
-                newWayPoint.Speed = ImagingReqs.TargetSpeed;
-                newWayPoint.LoiterTime   = std::nanf("");
-                newWayPoint.GimbalPitch   = std::nanf("");
-                newWayPoint.CornerRadius = 5.0f;
-                Mission.Waypoints.push_back(newWayPoint);
-            }
-        }
-        //MapWidget::Instance().m_guidanceOverlay.SetSurveyRegionPartition(Partition);
     }
 
     //5 - Take a Time Available function, a waypoint mission, and a progress indicator (where in the mission you are) and detirmine whether or not the drone
@@ -1100,11 +867,11 @@ namespace Guidance {
     //TA                - Input - Time Available function
     //SubregionMissions - Input - A vector of drone Missions - Element n is the mission for sub-region n.
     //StartPos          - Input - The starting position of the drone (to tell us how far away from each sub-region mission it is)
-    //ImagingReqs       - Input - Parameters specifying speed and row spacing (see definitions in struct declaration)
+    //MissionParams     - Input - Parameters specifying speed and row spacing (see definitions in struct declaration)
     //
     //Returns: The index of the drone mission (and sub-region) to task the drone to. Returns -1 if none are plausable
     int SelectSubRegion(ShadowPropagation::TimeAvailableFunction const & TA, std::vector<DroneInterface::WaypointMission> const & SubregionMissions,
-                        DroneInterface::Waypoint const & StartPos, ImagingRequirements const & ImagingReqs) {
+                        DroneInterface::Waypoint const & StartPos, MissionParameters const & MissionParams) {
         //TODO
         return -1;
     }
@@ -1177,7 +944,7 @@ namespace Guidance {
     }
 
     // Return the number of subregions that can be completely imaged given TA
-    int GetCoverage(std::vector<int> & PredictedCoverage, std::vector<int> & MissionDurations, ShadowPropagation::TimeAvailableFunction const & TA, std::vector<DroneInterface::WaypointMission> const & SubregionMissions, std::vector<std::vector<int>> const & Sequences, std::vector<DroneInterface::Waypoint> const & StartPositions, ImagingRequirements const & ImagingReqs, const int NumDrones) {
+    int GetCoverage(std::vector<int> & PredictedCoverage, std::vector<int> & MissionDurations, ShadowPropagation::TimeAvailableFunction const & TA, std::vector<DroneInterface::WaypointMission> const & SubregionMissions, std::vector<std::vector<int>> const & Sequences, std::vector<DroneInterface::Waypoint> const & StartPositions, MissionParameters const & MissionParams, const int NumDrones) {
         MissionDurations.clear();
         PredictedCoverage.clear();
         int coverage = 0;
@@ -1193,17 +960,20 @@ namespace Guidance {
             PredictedCoverage.push_back(0);
             for (size_t destWaypointIndex = 0; destWaypointIndex < Sequences[drone_idx].size(); destWaypointIndex++) {
                 DroneInterface::WaypointMission currentMission = SubregionMissions[Sequences[drone_idx][destWaypointIndex]];
-                // Add time from current position to starting waypoint of mission
-                DroneStartTime += std::chrono::seconds((int) EstimateMissionTime(DronePos, currentMission.Waypoints[0], ImagingReqs.TargetSpeed));
-                if (IsPredictedToFinishWithoutShadows(TA, currentMission, 0, DroneStartTime, Margin)) {
-                    coverage++;
-                    if (destWaypointIndex == 0) { // PredictedCoverage tracks the predicted shadowed-ness of the imminent mission, which is index 0.
-                        PredictedCoverage[drone_idx]++;
+                
+                //If the mission is trivial, skip it - don't count it as being covered either
+                if (! currentMission.Waypoints.empty()) {
+                    DroneStartTime += std::chrono::seconds((int) EstimateMissionTime(DronePos, currentMission.Waypoints[0], MissionParams.TargetSpeed));
+                    if (IsPredictedToFinishWithoutShadows(TA, currentMission, 0, DroneStartTime, Margin)) {
+                        coverage++;
+                        if (destWaypointIndex == 0) { // PredictedCoverage tracks the predicted shadowed-ness of the imminent mission, which is index 0.
+                            PredictedCoverage[drone_idx]++;
+                        }
                     }
+                    // Add time to fly mission
+                    DroneStartTime += std::chrono::seconds((int) EstimateMissionTime(currentMission, MissionParams.TargetSpeed));
+                    DronePos = currentMission.Waypoints.back();
                 }
-                // Add time to fly mission
-                DroneStartTime += std::chrono::seconds((int) EstimateMissionTime(currentMission, ImagingReqs.TargetSpeed));
-                DronePos = currentMission.Waypoints.back();
             }
             MissionDurations.push_back(SecondsElapsed(NowTime, DroneStartTime));
         }
@@ -1221,7 +991,7 @@ namespace Guidance {
     //Sequences           - Output - Element k is a vector of sub-region indices to task drone k to (in order)
     void SelectSubregionSequences(ShadowPropagation::TimeAvailableFunction const & TA, std::vector<DroneInterface::WaypointMission> const & SubregionMissions,
                                  std::vector<DroneInterface::Waypoint> const & DroneStartPositions, std::set<int> MissionIndicesToAssign, std::vector<std::vector<int>> & Sequences,
-                                 ImagingRequirements const & ImagingReqs) {
+                                 MissionParameters const & MissionParams) {
         
         int numDrones = DroneStartPositions.size();
         int numMissions = SubregionMissions.size();
@@ -1307,7 +1077,7 @@ namespace Guidance {
 
                 // Find coverage and maximum mission duration of potential sequence
                 std::vector<int> PredictedCoverage, MissionDurations;
-                int coverage = GetCoverage(PredictedCoverage, MissionDurations, TA, SubregionMissions, newSequence, DroneStartPositions, ImagingReqs, numDrones);
+                int coverage = GetCoverage(PredictedCoverage, MissionDurations, TA, SubregionMissions, newSequence, DroneStartPositions, MissionParams, numDrones);
                 int start_unclouded = std::accumulate(PredictedCoverage.begin(), PredictedCoverage.end(), 0);
                 mission_time = *max_element(MissionDurations.begin(), MissionDurations.end());
 
@@ -1331,13 +1101,12 @@ namespace Guidance {
             // Remove missions that were assigned
             for (size_t i = 0; i < bestSequence.size(); i++) {
                 extend(Sequences[i], bestSequence[i]);
-                for (size_t j = 0; j < bestSequence[i].size(); j++) {
+                for (size_t j = 0; j < bestSequence[i].size(); j++)
                     MissionIndicesToAssign.erase(bestSequence[i][j]);
-                }
             }
         }
         std::cout << "BestPredictedCoverage: " << std::endl;
-        for (int i = 0; i < BestPredictedCoverage.size(); i++) {
+        for (int i = 0; i < (int) BestPredictedCoverage.size(); i++) {
             std::cout << BestPredictedCoverage[i] << " ";
         }
         std::cout << std::endl;
