@@ -35,7 +35,7 @@
 namespace Guidance {
 	//A struct containing a few parameters typically needed at the same time to define a conventional serpentine waypoint mission.
 	//Also specifies some other mission options like whether to stagger drone heights, etc.
-	//The SidelapFraction, HAG, and HFOV detirmine the row spacing for passes in a serpentine flight pattern according to equation:
+	//The SidelapFraction, HAG, and HFOV determine the row spacing for passes in a serpentine flight pattern according to equation:
 	//Row spacing = 2 * HAG * tan(0.5 * HFOV) * (1 - SidelapFraction)
 	struct MissionParameters {
 		public:
@@ -93,7 +93,7 @@ namespace Guidance {
 			std::unordered_map<int, double> m_taskedMissionDistances; //MissionIndex -> Total travel distance for mission (including getting to WP0)
 			std::unordered_map<int, double> m_taskedMissionProgress;  //MissionIndex -> Distance traveled since mission start
 			std::Eunordered_map<std::string, Eigen::Vector3d> m_dronePositions; //Serial -> last known position (LLA)
-			std::unordered_set<int> m_availableMissionIndices;
+			std::unordered_set<int> m_availableMissionIndices; //Indices of missions that have not been assigned yet
 			
 			void ModuleMain(void);
 			void ResetIntermediateData(void); //Clear mission prep data and periodically updated fields
@@ -103,7 +103,7 @@ namespace Guidance {
 			void UpdateDroneStatesBasedOnMissionProgress(void);
 			std::vector<DroneInterface::Drone *> GetDronesAvailableForTasking(void);
 			void TaskDroneToAvailableMission(DroneInterface::Drone * DroneToTask);
-			void UpdateGuidanceOverlayWithMissionSequences(void);
+			void UpdateGuidanceOverlayWithMissionSequencesAndProgress(void);
 			bool AreAnyDronesTaskedWithOrFlyingMissions(void);
 			void AbortMissionsPredictedToGetHitWithShadows(void);
 			
@@ -123,8 +123,8 @@ namespace Guidance {
 			
 			//Starting a survey mission and adding a drone will automatically instruct the vehicle control to stop commanding the relavent drones
 			bool StartSurvey(std::vector<std::string> const & LowFlierSerials, MissionParameters const & Params); //Start a survey mission (currently active region) using the given drones
-			bool AddLowFlier(std::string const & Serial); //Add a drone to the collection of low fliers and start commanding it
-			bool RemoveLowFlier(std::string const & Serial); //Stop commanding the drone with the given serial
+			bool AddDroneToMission(std::string const & Serial); //Take control of a drone and add it to the current mission
+			bool RemoveDroneFromMission(std::string const & Serial); //Stop commanding the drone with the given serial
 			bool IsCommandingDrone(std::string const & Serial); //Returns true if drone is under guidance module command - false otherwise
 			bool IsRunning(void); //Returns true if currently commanding a mission, false otherwise
 
@@ -161,9 +161,11 @@ namespace Guidance {
 	//Region        - Input  - The input survey region or sub-region to cover (polygon collection in NM coords)
 	//Mission       - Output - The planned mission that covers the input region
 	//MissionParams - Input  - Parameters specifying speed and row spacing (see definitions in struct declaration)
+	//StartPos      - Input  - Optional: Initial position of vehicle (does not impact waypoints, but may impact ordering)
 	//
 	//Note: This function is not defined in Guidance.cpp, but is instead in FlightPlanning.cpp
-	void PlanMission(PolygonCollection const & Region, DroneInterface::WaypointMission & Mission, MissionParameters const & MissionParams);
+	void PlanMission(PolygonCollection const & Region, DroneInterface::WaypointMission & Mission, MissionParameters const & MissionParams,
+	                 DroneInterface::Waypoint const * StartPos);
 	
 	//5 - Take a Time Available function, a waypoint mission, and a progress indicator (where in the mission you are) and detirmine whether or not the drone
 	//    will be able to complete the mission in the time remaining (i.e. at no point will the time available within a radius of the drone hit 0).
@@ -186,14 +188,16 @@ namespace Guidance {
 	//    with shadows.
 	//Arguments:
 	//TA                      - Input - Time Available function
+	//SubRegionsNM            - Input - Polygon collections representing each sub-region (in Normalized Mercator)
 	//SubregionMissions       - Input - A vector of drone Missions - Element n is the mission for sub-region n.
 	//AvailableMissionIndices - Input - Set of indices of missions in SubregionMissions to consider
 	//StartPos                - Input - The starting position of the drone (to tell us how far away from each sub-region mission it is)
 	//MissionParams           - Input - Parameters specifying speed and row spacing (see definitions in struct declaration)
 	//
-	//Returns: The index of the drone mission (and sub-region) to task the drone to. Returns -1 if none are plausable
-	int SelectSubRegion(ShadowPropagation::TimeAvailableFunction const & TA, std::vector<DroneInterface::WaypointMission> const & SubregionMissions,
-	                    std::unordered_set<int> const & AvailableMissionIndices, DroneInterface::Waypoint const & StartPos, MissionParameters const & MissionParams);
+	//Returns: The index of the drone mission (and sub-region) to task the drone to. Returns -1 if none are plausible
+	int SelectSubRegion(ShadowPropagation::TimeAvailableFunction const & TA, std::Evector<PolygonCollection> const & SubRegionsNM,
+	                    std::vector<DroneInterface::WaypointMission> const & SubregionMissions, std::unordered_set<int> const & AvailableMissionIndices,
+	                    DroneInterface::Waypoint const & StartPos, MissionParameters const & MissionParams);
 	
 	//7 - Given a Time Available function, a collection of sub-regions (with their pre-planned missions), and a collection of drone start positions, choose
 	//    sequences (of a given length) of sub-regions for each drone to fly, in order. When the mission time exceeds our prediction horizon the time available

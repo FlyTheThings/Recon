@@ -47,22 +47,112 @@ namespace Guidance {
 			return false;
 	}
 
-	//Add a drone to the collection of low fliers and start commanding it
-	bool GuidanceEngine::AddLowFlier(std::string const & Serial) {
+	//Take control of a drone and add it to the current mission
+	bool GuidanceEngine::AddDroneToMission(std::string const & Serial) {
 		std::scoped_lock lock(m_mutex);
 		if (! m_running)
 			return false;
 		else {
-			for (auto drone : m_dronesUnderCommand) {
-				if (drone->GetDroneSerial() == Serial) {
-					VehicleControlWidget::Instance().StopCommandingDrone(Serial);
-					return true;
-				}
-			}
-			DroneInterface::Drone * ptr = DroneInterface::DroneManager::Instance().GetDrone(Serial);
-			if (ptr != nullptr) {
-				m_dronesUnderCommand.push_back(ptr);
+			DroneInterface::Drone * drone = DroneInterface::DroneManager::Instance().GetDrone(Serial);
+			if (drone != nullptr) {
 				VehicleControlWidget::Instance().StopCommandingDrone(Serial);
+
+				m_dronesUnderCommand.push_back(drone);
+				TimePoint NowTime = std::chrono::steady_clock::now();
+
+				//Go through the allowed takeoff times - find the last takeoff time and advance it by the stagger time for the added drone
+				TimePoint lastTimepoint = NowTime;
+				double maxSecondsSinceT0Epoch = 0.0;
+				for (auto const & kv : m_droneAllowedTakeoffTimes) {
+					double secondsAfterT0 = SecondsSinceT0Epoch(kv.second);
+					if (secondsAfterT0 > maxSecondsSinceT0Epoch) {
+						maxSecondsSinceT0Epoch = secondsAfterT0;
+						lastTimepoint = kv.second;
+					}
+				}
+				if (maxSecondsSinceT0Epoch == 0.0)
+					m_droneAllowedTakeoffTimes[Serial] = std::chrono::steady_clock::now(); //There are no other drones
+				else
+					m_droneAllowedTakeoffTimes[Serial] = AdvanceTimepoint(lastTimepoint, m_MissionParams.TakeoffStaggerInterval);
+				
+				//Go through the HAGs and find an available slot for the new drone
+				if (m_droneHAGs.empty())
+					m_droneHAGs[Serial] = m_MissionParams.HAG;
+				else {
+					if (m_MissionParams.HeightStaggerInterval <= 0.0)
+						m_droneHAGs[Serial] = m_MissionParams.HAG;
+					else {
+						//Look at the drones currently assigned to the mission and get their HAGs. Identify the value X that is closest
+						//to the target HAG but at least the staggering amount away from all existing drone HAGs.
+
+						//Find the lowest HAG
+						double lowestHAG = m_droneHAGs.begin()->second;
+						for (auto const & kv : m_droneHAGs) {
+							if (kv.second < lowestHAG)
+								lowestHAG = kv.second;
+						}
+
+						std::vector<double> currentHAGSlots; //HAGs, as multiples of the stagger interval above the lowest HAG
+						currentHAGSlots.reserve(m_droneHAGs.size());
+						for (auto const & kv : m_droneHAGs)
+							currentHAGSlots.push_back((kv.second - lowestHAG) / m_MissionParams.HeightStaggerInterval);
+						std::sort(currentHAGSlots.begin(), currentHAGSlots.end());
+						double maxSlot = currentHAGSlots.back();
+
+						//std::cerr << "Current HAG slots: ";
+						//for (double HAGSlot : currentHAGSlots)
+						//	std::cerr << HAGSlot << " ";
+						//std::cerr << "\r\n";
+
+						//The slots should basically be integers, starting with 0. If there is an interior integer missing we can use the slot
+						double interiorSlot = -1.0;
+						for (double slot = 1.0; slot <= maxSlot; slot += 1.0) {
+							bool slotOK = true;
+							for (double currentSlot : currentHAGSlots) {
+								if (std::fabs(slot - currentSlot) < 0.9) {
+									slotOK = false;
+									break;
+								}
+							}
+							if (slotOK) {
+								interiorSlot = slot;
+								break;
+							}
+						}
+
+						if (interiorSlot >= 0.0) {
+							//HAG slot found
+							m_droneHAGs[Serial] = lowestHAG + m_MissionParams.HeightStaggerInterval*interiorSlot;
+							std::cerr << "Using existing HAG slot for added drone: " << m_droneHAGs.at(Serial) << " m.\r\n";
+						}
+						else {
+							//No interior HAG slots found - add a slot on either the high or low end
+							//Take whichever is closest to the target HAG.
+							double candidateHAG1 = lowestHAG - m_MissionParams.HeightStaggerInterval;
+							double candidateHAG2 = lowestHAG + (maxSlot + 1.0)*m_MissionParams.HeightStaggerInterval;
+							if (std::fabs(candidateHAG1 - m_MissionParams.HAG) < std::fabs(candidateHAG2 - m_MissionParams.HAG))
+								m_droneHAGs[Serial] = candidateHAG1;
+							else
+								m_droneHAGs[Serial] = candidateHAG2;
+							std::cerr << "Using new HAG slot for added drone: " << m_droneHAGs.at(Serial) << " m.\r\n";
+						}
+					}
+				}
+
+				//Initialize the state of the drone
+				bool isFlying = false;
+				TimePoint isFlyingTimestamp;
+				if (drone->IsCurrentlyFlying(isFlying, isFlyingTimestamp) && (SecondsElapsed(isFlyingTimestamp) <= 4.0)) {
+					if (isFlying)
+						m_droneStates[Serial] = std::make_tuple(1, -1, NowTime); //Loitering (available for tasking anyhow)
+					else
+						m_droneStates[Serial] = std::make_tuple(0, -1, NowTime); //On ground and available for tasking
+				}
+				else {
+					std::cerr << "Bad or old telemetry for drone " << Serial << ". Treating as on ground.\r\n";
+					m_droneStates[Serial] = std::make_tuple(0, -1, NowTime); //On ground and available for tasking
+				}
+				
 				return true;
 			}
 			else
@@ -71,7 +161,7 @@ namespace Guidance {
 	}
 
 	//Stop commanding the drone with the given serial
-	bool GuidanceEngine::RemoveLowFlier(std::string const & Serial) {
+	bool GuidanceEngine::RemoveDroneFromMission(std::string const & Serial) {
 		std::scoped_lock lock(m_mutex);
 		if (! m_running)
 			return false;
@@ -91,7 +181,9 @@ namespace Guidance {
 
 				//Remove the drone from our vector of drone pointers under our command
 				m_dronesUnderCommand.erase(m_dronesUnderCommand.begin() + n);
-				std::cerr << "Removing drone from command.\r\n";
+				m_droneHAGs.erase(Serial);
+				m_droneAllowedTakeoffTimes.erase(Serial);
+				std::cerr << "Removing drone " << Serial << " from command.\r\n";
 
 				//If we just removed the last drone, abort the mission - this makes it unnecessary to have an extra UI control
 				//to cancel a mission that has effectively already been canceled through the removal of all drones.
@@ -181,17 +273,29 @@ namespace Guidance {
 				PartitionSurveyRegion_IteratedCuts(m_surveyRegion, m_surveyRegionPartition, m_MissionParams);
 			else
 				std::cerr << "Error: Unrecognized partitioning method. Skipping partitioning.\r\n";
-			MapWidget::Instance().m_guidanceOverlay.SetSurveyRegionPartition(m_surveyRegionPartition);
+			std::vector<std::string> compLabels(m_surveyRegionPartition.size());
+			for (size_t n = 0U; n < m_surveyRegionPartition.size(); n++) {
+				Eigen::Vector4d AABB = m_surveyRegionPartition[n].GetAABB();
+				double mPerNMUnit = NMUnitsToMeters(1.0, 0.5*AABB(2) + 0.5*AABB(3));
+				double sqMPerNMAreaUnit = mPerNMUnit * mPerNMUnit;
+				double area_sqM = sqMPerNMAreaUnit * m_surveyRegionPartition[n].GetArea();
+				double area_acres = area_sqM / 4046.86;
+				std::ostringstream outSS;
+				outSS << "Sub-Region " << n << "\n" << std::fixed << std::setprecision(1) << area_acres << " acres";
+				compLabels[n] = outSS.str();
+			}
+			MapWidget::Instance().m_guidanceOverlay.SetData_SurveyRegionPartition(m_surveyRegionPartition, compLabels);
 
-			//Plan missions for each component of the partition
+			//Plan missions for each component of the partition - we are guaranteed a mission object for each sub-region, but
+			//the missions may be empty if the region is too pathological. These should be treated as complete right off the bat.
 			m_droneMissions.clear();
 			m_droneMissions.reserve(m_surveyRegionPartition.size());
 			for (auto const & component : m_surveyRegionPartition) {
 				DroneInterface::WaypointMission Mission;
-				PlanMission(component, Mission, m_MissionParams);
+				PlanMission(component, Mission, m_MissionParams, nullptr);
 				m_droneMissions.push_back(Mission);
 			}
-			MapWidget::Instance().m_guidanceOverlay.SetMissions(m_droneMissions);
+			MapWidget::Instance().m_guidanceOverlay.SetData_PlannedMissions(m_droneMissions);
 
 			//Initialize states, and available indices
 			m_droneStates.clear();
@@ -323,25 +427,6 @@ namespace Guidance {
 		return availableDrones;
 	}
 
-	//Get the horizontal distance (m) between two waypoints
-	static double GetHorizontalDistBetweenWaypoints(DroneInterface::Waypoint const & WPA, DroneInterface::Waypoint const & WPB) {
-		Eigen::Vector3d A_ECEF = LLA2ECEF(Eigen::Vector3d(WPA.Latitude, WPA.Longitude, 0.0)); //A - projected to ref ellipsoid
-		Eigen::Vector3d B_ECEF = LLA2ECEF(Eigen::Vector3d(WPB.Latitude, WPB.Longitude, 0.0)); //B - projected to ref ellipsoid
-		double horizontalDist  = (B_ECEF - A_ECEF).norm();
-		return horizontalDist;
-	}
-
-	//Get the total horizontal travel distance (m) for a mission, including from a start position to the first waypoint
-	static double GetTotalMissionHorizontalDistance(DroneInterface::WaypointMission const & Mission, DroneInterface::Waypoint const & StartPos) {
-		if (Mission.Waypoints.empty())
-			return 0.0;
-
-		double totalDist = GetHorizontalDistBetweenWaypoints(StartPos, Mission.Waypoints[0]);
-		for (size_t n = 0U; (n + 1U) < Mission.Waypoints.size(); n++)
-			totalDist += GetHorizontalDistBetweenWaypoints(Mission.Waypoints[n], Mission.Waypoints[n + 1U]);
-		return totalDist;
-	}
-
 	//Task a drone to an available mission and update states accordingly
 	void GuidanceEngine::TaskDroneToAvailableMission(DroneInterface::Drone * DroneToTask) {
 		if (! m_availableMissionIndices.empty()) {
@@ -352,30 +437,49 @@ namespace Guidance {
 			currentPos.Longitude = droneLLA(1);
 			currentPos.RelAltitude = 0.0;
 
-			int missionIndex = SelectSubRegion(m_TA, m_droneMissions, m_availableMissionIndices, currentPos, m_MissionParams);
+			int missionIndex = SelectSubRegion(m_TA, m_surveyRegionPartition, m_droneMissions, m_availableMissionIndices, currentPos, m_MissionParams);
 			if (missionIndex >= 0) {
-				//There is sub-region we may be able to fly - task drone
+				//There is sub-region we may be able to fly
+
+				//Re-optimize the mission for this sub-region based on the drones current (starting) position
+				//std::cerr << "Mission for sub-region " << missionIndex << " being re-optimized.\r\n";
+				PlanMission(m_surveyRegionPartition[missionIndex], m_droneMissions[missionIndex], m_MissionParams, &currentPos);
+				MapWidget::Instance().m_guidanceOverlay.SetData_PlannedMissions(m_droneMissions);
+
+				//Task drone to the updated mission
 				m_availableMissionIndices.erase(missionIndex);
 				TaskDroneWithMission(DroneToTask, m_droneMissions[missionIndex]);
 				m_droneStates.at(DroneToTask->GetDroneSerial()) = std::make_tuple(2, missionIndex, std::chrono::steady_clock::now());
 
 				//Compute the total travel distance for the mission we are tasking and initialize progress fields
-				m_taskedMissionDistances[missionIndex] = GetTotalMissionHorizontalDistance(m_droneMissions[missionIndex], currentPos);
+				m_taskedMissionDistances[missionIndex] = m_droneMissions[missionIndex].TotalMissionDistance2D(&currentPos);
 				m_taskedMissionProgress[missionIndex]  = 0.0;
 			}
 		}
 	}
 
-	void GuidanceEngine::UpdateGuidanceOverlayWithMissionSequences(void) {
+	void GuidanceEngine::UpdateGuidanceOverlayWithMissionSequencesAndProgress(void) {
 		std::vector<std::vector<int>> Sequences;
+		std::unordered_set<int> missionsInProgress;
 		for (DroneInterface::Drone * drone : m_dronesUnderCommand) {
 			std::string serial = drone->GetDroneSerial();
-			if (std::get<0>(m_droneStates.at(serial)) > 1)
-				Sequences.emplace_back(1, std::get<1>(m_droneStates.at(serial)));
+			if (std::get<0>(m_droneStates.at(serial)) > 1) {
+				int missionIndex = std::get<1>(m_droneStates.at(serial));
+				Sequences.emplace_back(1, missionIndex);
+				missionsInProgress.insert(missionIndex);
+			}
 			else
 				Sequences.emplace_back();
 		}
-		MapWidget::Instance().m_guidanceOverlay.SetDroneMissionSequences(Sequences);
+		MapWidget::Instance().m_guidanceOverlay.SetData_DroneMissionSequences(Sequences);
+
+		std::vector<int> completedSubregionIndices;
+		completedSubregionIndices.reserve(m_surveyRegionPartition.size());
+		for (int n = 0; n < (int) m_surveyRegionPartition.size(); n++) {
+			if ((m_availableMissionIndices.count(n) == 0U) && (missionsInProgress.count(n) == 0U))
+				completedSubregionIndices.push_back(n);
+		}
+		MapWidget::Instance().m_guidanceOverlay.SetData_CompletedSubRegions(completedSubregionIndices);
 	}
 
 	bool GuidanceEngine::AreAnyDronesTaskedWithOrFlyingMissions(void) {
@@ -435,8 +539,12 @@ namespace Guidance {
 		}
 	}
 
+	//Note: Carefully evaluate rick of deadlocking due to mutex locking. The guidance module holds it's lock for way
+	//longer than I would like and it holds the lock while it calls methods in other modules that probably also lock
+	//mutexes. Try to shorten the lock holds and avoid lock nests.
+
 	void GuidanceEngine::ModuleMain(void) {
-		double AnalysisPeriod = 1.0; //Analyse drone tasking every this many seconds
+		double AnalysisPeriod = 1.0; //Analyze drone tasking every this many seconds
 		TimePoint LastAnalysisTP = AdvanceTimepoint(std::chrono::steady_clock::now(), -1.0*AnalysisPeriod);
 		while (! m_abort) {
 			//Grab any settings that we may need before starting the loop - ensure we don't hold a lock on m_mutex while locking the options mutex
@@ -483,7 +591,7 @@ namespace Guidance {
 				for (DroneInterface::Drone * drone : dronesForTasking)
 					TaskDroneToAvailableMission(drone);
 
-				UpdateGuidanceOverlayWithMissionSequences();
+				UpdateGuidanceOverlayWithMissionSequencesAndProgress();
 
 				//Check to see if the mission is complete
 				if ((m_availableMissionIndices.empty()) && (! AreAnyDronesTaskedWithOrFlyingMissions()))
@@ -648,53 +756,75 @@ namespace Guidance {
 	//    with shadows.
 	//Arguments:
 	//TA                      - Input - Time Available function
+	//SubRegionsNM            - Input - Polygon collections representing each sub-region (in Normalized Mercator)
 	//SubregionMissions       - Input - A vector of drone Missions - Element n is the mission for sub-region n.
 	//AvailableMissionIndices - Input - Set of indices of missions in SubregionMissions to consider
 	//StartPos                - Input - The starting position of the drone (to tell us how far away from each sub-region mission it is)
 	//MissionParams           - Input - Parameters specifying speed and row spacing (see definitions in struct declaration)
 	//
-	//Returns: The index of the drone mission (and sub-region) to task the drone to. Returns -1 if none are plausable
-	int SelectSubRegion(ShadowPropagation::TimeAvailableFunction const & TA, std::vector<DroneInterface::WaypointMission> const & SubregionMissions,
-	                    std::unordered_set<int> const & AvailableMissionIndices, DroneInterface::Waypoint const & StartPos,
-	                    MissionParameters const & MissionParams) {
+	//Returns: The index of the drone mission (and sub-region) to task the drone to. Returns -1 if none are viable
+	int SelectSubRegion(ShadowPropagation::TimeAvailableFunction const & TA, std::Evector<PolygonCollection> const & SubRegionsNM,
+	                    std::vector<DroneInterface::WaypointMission> const & SubregionMissions, std::unordered_set<int> const & AvailableMissionIndices,
+	                    DroneInterface::Waypoint const & StartPos, MissionParameters const & MissionParams) {
 		using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
 
 		if (AvailableMissionIndices.empty())
 			return -1;
 
-		//For each available mission, figure out if it is viable (can we fly it before getting hit with shadows?) and if so,
-		//Compute the travel time to reach and start the mission. Select the mission that we can get to the fastest, out of
-		//all viable missions.
+		//For each available mission, figure out if it is viable (can we fly it before getting hit with shadows?). Select the
+		//best viable mission. We do this based on distance from the drone to the sub-region. This heuristic is appropriate
+		//when we plan on re-planning the mission once a region is selected. If we don't, we could just go based on distance
+		//from the first waypoint. What we are doing here has one drawback - the assessment of whether a region is viable is based
+		//on the current planned mission for a region, which may not be optimal (given the drones starting point) and may be updated
+		//after a drone is tasked to the sub-region. Consequently, we may overlook some regions that are barely viable with a better
+		//mission, but not if we fly the original planned mission. This is relatively minor and means our shadow avoidance may err
+		//slightly on the cautious side in such circumstances.
+		Eigen::Vector2d StartPos_LL(StartPos.Latitude, StartPos.Longitude);
+		Eigen::Vector2d StartPos_NM = LatLonToNM(StartPos_LL);
 
-		int    bestMissionIndex       = -1;
-		double timeToReachBestMission = std::nan("");
+		int    bestSubregionIndex     = -1;
+		//double timeToReachBestMission = std::nan("");
+		double distToBestRegion       = std::nan("");
 		int    numViableRegions       = 0;
-		for (int missionIndex : AvailableMissionIndices) {
-			if (! SubregionMissions[missionIndex].Waypoints.empty()) {
-				DroneInterface::Waypoint WP0 = SubregionMissions[missionIndex].Waypoints[0];
+		for (int subregionIndex : AvailableMissionIndices) {
+			if (! SubregionMissions[subregionIndex].Waypoints.empty()) {
+				DroneInterface::Waypoint WP0 = SubregionMissions[subregionIndex].Waypoints[0];
 				double timeToReachRegion     = EstimateMissionTime(StartPos, WP0, MissionParams.TargetSpeed);
 				TimePoint missionStartTime   = AdvanceTimepoint(std::chrono::steady_clock::now(), timeToReachRegion);
 				double margin;
-				if (IsPredictedToFinishWithoutShadows(TA, SubregionMissions[missionIndex], 0.0, missionStartTime, margin)) {
+				if (IsPredictedToFinishWithoutShadows(TA, SubregionMissions[subregionIndex], 0.0, missionStartTime, margin)) {
 					//This region is viable
 					numViableRegions++;
-					if ((bestMissionIndex < 0) || (timeToReachRegion < timeToReachBestMission)) {
-						bestMissionIndex       = missionIndex;
-						timeToReachBestMission = timeToReachRegion;
+
+					//Compute distance to sub-region. This is in NM units - we could convert to m using the drones position, but
+					//since we are only using this to compare distances we can skip that and just compare distances in NM units.
+					double distToSubregion = (SubRegionsNM[subregionIndex].ProjectPoint(StartPos_NM) - StartPos_NM).norm();
+					//std::cerr << "Viable sub-region. Dist: " << distToSubregion << " NM units.\r\n";
+					if ((bestSubregionIndex < 0) || (distToSubregion < distToBestRegion)) {
+						bestSubregionIndex = subregionIndex;
+						distToBestRegion   = distToSubregion;
+						//std::cerr << "Updating best sub-region. Dist: " << distToBestRegion << " NM units.\r\n";
 					}
+
+					//TODO: Here
+
+					/*if ((bestSubregionIndex < 0) || (timeToReachRegion < timeToReachBestMission)) {
+						bestSubregionIndex     = subregionIndex;
+						timeToReachBestMission = timeToReachRegion;
+					}*/
 				}
 				//else
-				//	std::cerr << "Region " << missionIndex << " is non-viable.\r\n";
+				//	std::cerr << "Region " << subregionIndex << " is non-viable.\r\n";
 			}
 		}
 		//std::cerr << "Num viable regions: " << numViableRegions << "\r\n";
 
-		return bestMissionIndex;
+		return bestSubregionIndex;
 	}
 
 	//7 - Given a Time Available function, a collection of sub-regions (with their pre-planned missions), and a collection of drone start positions, choose
 	//    sequences (of a given length) of sub-regions for each drone to fly, in order. When the mission time exceeds our prediction horizon the time available
-	//    function is no longer useful in chosing sub-regions but they can still be chosen in a logical fashion that avoids leaving holes in the map... making the
+	//    function is no longer useful in choosing sub-regions but they can still be chosen in a logical fashion that avoids leaving holes in the map... making the
 	//    optimistic assumption that they will be shadow-free when we get there.
 	//TA                  - Input  - Time Available function
 	//SubregionMissions   - Input  - A vector of drone Missions - Element n is the mission for sub-region n.
